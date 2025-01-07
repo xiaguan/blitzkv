@@ -104,13 +104,23 @@ impl Database {
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<(), DatabaseError> {
-        if self.index.remove(key).is_some() {
-            // Key was found and removed from index
-            // Note: The actual data remains in storage unit but becomes inaccessible
-            // A future compaction process could reclaim this space
-            Ok(())
+        if let Some(location) = self.index.get(key) {
+            // Find the storage unit
+            if let Some(unit) = self
+                .storage_units
+                .iter_mut()
+                .find(|u| u.id() == location.unit_id)
+            {
+                // Remove the entry from storage unit
+                if unit.remove_entry(key) {
+                    // Remove the key from index
+                    self.index.remove(key);
+                    return Ok(());
+                }
+            }
+            return Err(DatabaseError::InvalidData);
         } else {
-            Err(DatabaseError::KeyNotFound)
+            return Err(DatabaseError::KeyNotFound);
         }
     }
 

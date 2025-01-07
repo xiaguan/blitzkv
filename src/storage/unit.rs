@@ -347,4 +347,23 @@ impl StorageUnit {
     pub fn id(&self) -> u64 {
         self.header.id
     }
+
+    pub fn remove_entry(&mut self, key: &[u8]) -> bool {
+        let mut index = 0;
+        let mut found = false;
+        for entry in &self.data {
+            if entry.key == key {
+                found = true;
+                break;
+            }
+            index += 1;
+        }
+        if found {
+            let removed_entry = self.data.remove(index);
+            self.current_size -= removed_entry.total_size();
+            true
+        } else {
+            false
+        }
+    }
 }
