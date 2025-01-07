@@ -1,25 +1,14 @@
-use crate::storage::unit::StorageUnit;
+use crate::storage::PageManager;
 use std::collections::BTreeMap;
 
-const DEFAULT_STORAGE_SIZE: u32 = 400; // 4KB default storage unit size
+const DEFAULT_PAGE_SIZE: u32 = 4096; // 4KB page size
 
 #[derive(Debug)]
 pub struct Database {
     // Memory index mapping keys to their location
     index: BTreeMap<Vec<u8>, Location>,
-    // Collection of storage units
-    storage_units: Vec<StorageUnit>,
-    // Current active storage unit for writes
-    current_unit_id: u64,
-}
-
-impl std::fmt::Display for Database {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        for unit in &self.storage_units {
-            write!(f, "{}\n", unit)?;
-        }
-        Ok(())
-    }
+    // Page manager for storage allocation
+    page_manager: PageManager,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -37,61 +26,36 @@ pub enum DatabaseError {
 
 impl Database {
     pub fn new() -> Self {
-        let initial_unit = StorageUnit::new(0, DEFAULT_STORAGE_SIZE);
         Database {
             index: BTreeMap::new(),
-            storage_units: vec![initial_unit],
-            current_unit_id: 0,
+            page_manager: PageManager::new(DEFAULT_PAGE_SIZE),
         }
     }
 
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), DatabaseError> {
-        // Try to write to current storage unit
-        let current_unit = self.storage_units.last_mut().unwrap();
-
-        if let Some(offset) = current_unit.push_entry(key, value) {
+        // Try to allocate space for the entry
+        if let Some(page_id) = self.page_manager.allocate_entry(key, value) {
             // Update index with new location
             self.index.insert(
                 key.to_vec(),
                 Location {
-                    unit_id: self.current_unit_id,
-                    offset,
+                    unit_id: page_id,
+                    offset: 0, // Offset is managed internally by Page now
                 },
             );
             Ok(())
         } else {
-            // Current unit is full, create new one
-            self.current_unit_id += 1;
-            let mut new_unit = StorageUnit::new(self.current_unit_id, DEFAULT_STORAGE_SIZE);
-
-            // Try writing to new unit
-            if let Some(offset) = new_unit.push_entry(key, value) {
-                self.storage_units.push(new_unit);
-                self.index.insert(
-                    key.to_vec(),
-                    Location {
-                        unit_id: self.current_unit_id,
-                        offset,
-                    },
-                );
-                Ok(())
-            } else {
-                Err(DatabaseError::StorageFull)
-            }
+            Err(DatabaseError::StorageFull)
         }
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Vec<u8>, DatabaseError> {
         // Look up key in index
         if let Some(location) = self.index.get(key) {
-            // Find the storage unit
-            if let Some(unit) = self
-                .storage_units
-                .iter()
-                .find(|u| u.id() == location.unit_id)
-            {
+            // Get the page from page manager
+            if let Some(page) = self.page_manager.get_page(location.unit_id) {
                 // Iterate through entries to find the matching key
-                for entry in unit.iter() {
+                for entry in page.iter() {
                     if entry.key() == key {
                         return Ok(entry.value().to_vec());
                     }
@@ -104,23 +68,15 @@ impl Database {
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<(), DatabaseError> {
-        if let Some(location) = self.index.get(key) {
-            // Find the storage unit
-            if let Some(unit) = self
-                .storage_units
-                .iter_mut()
-                .find(|u| u.id() == location.unit_id)
-            {
-                // Remove the entry from storage unit
-                if unit.remove_entry(key) {
-                    // Remove the key from index
-                    self.index.remove(key);
-                    return Ok(());
-                }
+        if let Some(location) = self.index.get(key).cloned() {
+            if self.page_manager.remove_entry(location.unit_id, key) {
+                self.index.remove(key);
+                Ok(())
+            } else {
+                Err(DatabaseError::InvalidData)
             }
-            return Err(DatabaseError::InvalidData);
         } else {
-            return Err(DatabaseError::KeyNotFound);
+            Err(DatabaseError::KeyNotFound)
         }
     }
 
@@ -139,14 +95,14 @@ impl Database {
         self.index.is_empty()
     }
 
-    // Get total size of all storage units
+    // Get total size of all pages
     pub fn total_size(&self) -> usize {
-        self.storage_units.iter().map(|unit| unit.size()).sum()
+        self.page_manager.total_used_space()
     }
 
-    // Get total capacity of all storage units
+    // Get total capacity of all pages
     pub fn total_capacity(&self) -> usize {
-        self.storage_units.iter().map(|unit| unit.capacity()).sum()
+        self.page_manager.total_capacity()
     }
 
     // Calculate overall space amplification
@@ -154,6 +110,15 @@ impl Database {
         let total_size = self.total_size() as f64;
         let data_size = self.index.len() as f64; // Simplified - actual data size would need key/value sizes
         total_size / data_size
+    }
+}
+
+impl std::fmt::Display for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        for page in self.page_manager.iter_pages() {
+            write!(f, "{}\n", page)?;
+        }
+        Ok(())
     }
 }
 

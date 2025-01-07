@@ -11,14 +11,14 @@ use std::slice::Iter;
 const MAGIC_HEADER: &str = "blitzkv";
 
 #[derive(Debug)]
-pub struct StorageUnit {
-    header: StorageHeader,
+pub struct Page {
+    header: PageHeader,
     data: Vec<Entry>,
     current_size: usize,
 }
 
 // impl display for StorageUnit
-impl std::fmt::Display for StorageUnit {
+impl std::fmt::Display for Page {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
@@ -32,7 +32,7 @@ impl std::fmt::Display for StorageUnit {
 }
 
 #[derive(Debug)]
-struct StorageHeader {
+struct PageHeader {
     magic: String, // Magic header to identify storage format
     id: u64,       // Unique identifier for the storage unit
     size: u32,     // Total size of the storage unit in bytes
@@ -61,7 +61,7 @@ const HEADER_SIZE: usize = MAGIC_SIZE + ID_SIZE + SIZE_FIELD_SIZE + CRC32_SIZE;
 
 const ENTRY_METADATA_SIZE: usize = SIZE_FIELD_SIZE * 2; // key_size + value_size + deleted flag
 
-impl StorageHeader {
+impl PageHeader {
     // Serialize header into a mutable buffer
     fn write_to_buffer(&self, buf: &mut [u8]) -> usize {
         assert!(buf.len() >= HEADER_SIZE);
@@ -94,7 +94,7 @@ impl StorageHeader {
         );
 
         (
-            StorageHeader {
+            PageHeader {
                 magic,
                 id,
                 size,
@@ -201,11 +201,11 @@ impl Entry {
     }
 }
 
-impl StorageUnit {
+impl Page {
     // Create a new storage unit with a given ID and size
     pub fn new(id: u64, size: u32) -> Self {
-        StorageUnit {
-            header: StorageHeader {
+        Page {
+            header: PageHeader {
                 magic: MAGIC_HEADER.to_string(),
                 id,
                 size,
@@ -276,7 +276,7 @@ impl StorageUnit {
         let mut offset = 0;
 
         // Read header
-        let (header, header_size) = StorageHeader::read_from_buffer(&buf[offset..]);
+        let (header, header_size) = PageHeader::read_from_buffer(&buf[offset..]);
         offset += header_size;
 
         // Read number of entries
@@ -301,7 +301,7 @@ impl StorageUnit {
             panic!("CRC32 checksum mismatch");
         }
 
-        StorageUnit {
+        Page {
             header,
             data,
             current_size: offset,
