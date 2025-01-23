@@ -1,21 +1,28 @@
+use super::device::{SsdDevice, SsdError};
 use super::page::Page;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::path::Path;
+use std::rc::Rc;
 
 // Wrapper for Page that implements Ord for the binary heap
 // We want a max heap based on available space
 #[derive(Debug)]
 struct PageWrapper {
-    page: Page,
+    page: Rc<RefCell<Page>>,
 }
 
 impl PageWrapper {
     fn new(page: Page) -> Self {
-        PageWrapper { page }
+        PageWrapper {
+            page: Rc::new(RefCell::new(page)),
+        }
     }
 
     fn available_space(&self) -> usize {
-        self.page.capacity() - self.page.size()
+        let page = self.page.borrow();
+        page.capacity() - page.size()
     }
 }
 
@@ -41,37 +48,68 @@ impl PartialEq for PageWrapper {
 impl Eq for PageWrapper {}
 
 #[derive(Debug)]
+pub enum PageManagerError {
+    Storage(SsdError),
+    InvalidPage,
+}
+
+impl From<SsdError> for PageManagerError {
+    fn from(error: SsdError) -> Self {
+        PageManagerError::Storage(error)
+    }
+}
+
+#[derive(Debug)]
 pub struct PageManager {
     pages: BinaryHeap<PageWrapper>,
+    device: SsdDevice,
     next_id: u64,
     page_size: u32,
 }
 
 impl PageManager {
-    pub fn new(page_size: u32) -> Self {
-        PageManager {
+    pub fn new<P: AsRef<Path>>(path: P, page_size: u32) -> Result<Self, PageManagerError> {
+        let device = SsdDevice::new(path, page_size)?;
+        Ok(PageManager {
             pages: BinaryHeap::new(),
+            device,
             next_id: 0,
             page_size,
-        }
+        })
     }
 
     // Try to find a page with enough space for the entry
     // If no suitable page exists, create a new one
-    pub fn allocate_entry(&mut self, key: &[u8], value: &[u8]) -> Option<u64> {
+    pub fn allocate_entry(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<Option<u64>, PageManagerError> {
         let required_space = key.len() + value.len() + 8; // 8 bytes for metadata
 
         // Try to find a page with enough space
-        if let Some(mut wrapper) = self.pages.pop() {
-            if wrapper.available_space() >= required_space {
-                // Use this page
-                if let Some(_) = wrapper.page.push_entry(key, value) {
-                    let page_id = wrapper.page.id();
-                    self.pages.push(wrapper);
-                    return Some(page_id);
-                }
+        let mut found_page = None;
+        if let Some(wrapper) = self.pages.pop() {
+            let space = wrapper.available_space();
+            if space >= required_space {
+                found_page = Some(wrapper);
+            } else {
+                self.pages.push(wrapper);
             }
-            // Put the page back if we couldn't use it
+        }
+
+        if let Some(wrapper) = found_page {
+            let page_rc = Rc::clone(&wrapper.page);
+            let mut page = page_rc.borrow_mut();
+            if let Some(_) = page.push_entry(key, value) {
+                let id = page.id();
+                // Write the page to storage
+                self.device.write_page(&mut *page)?;
+                drop(page); // Explicitly drop the borrow
+                self.pages.push(wrapper);
+                return Ok(Some(id));
+            }
+            drop(page);
             self.pages.push(wrapper);
         }
 
@@ -81,22 +119,29 @@ impl PageManager {
 
         if let Some(_) = new_page.push_entry(key, value) {
             let page_id = new_page.id();
+            // Write the new page to storage
+            self.device.write_page(&mut new_page)?;
             self.pages.push(PageWrapper::new(new_page));
-            Some(page_id)
+            self.device.sync()?;
+            Ok(Some(page_id))
         } else {
-            None // Entry too large even for a new page
+            Ok(None) // Entry too large even for a new page
         }
     }
 
     // Remove an entry from a specific page
-    pub fn remove_entry(&mut self, page_id: u64, key: &[u8]) -> bool {
-        // Remove the page from the heap
-        let mut target_page = None;
+    pub fn remove_entry(&mut self, page_id: u64, key: &[u8]) -> Result<bool, PageManagerError> {
+        // Try to find the page in memory
+        let mut found_page = None;
         let mut temp_heap = BinaryHeap::new();
 
         while let Some(wrapper) = self.pages.pop() {
-            if wrapper.page.id() == page_id {
-                target_page = Some(wrapper);
+            let is_target = {
+                let page = wrapper.page.borrow();
+                page.id() == page_id
+            };
+            if is_target {
+                found_page = Some(wrapper);
                 break;
             }
             temp_heap.push(wrapper);
@@ -107,13 +152,33 @@ impl PageManager {
             self.pages.push(wrapper);
         }
 
-        // Remove the entry if we found the page
-        if let Some(mut wrapper) = target_page {
-            let result = wrapper.page.remove_entry(key);
+        if let Some(wrapper) = found_page {
+            let page_rc = Rc::clone(&wrapper.page);
+            let mut page = page_rc.borrow_mut();
+            let result = page.remove_entry(key);
+            if result {
+                // Update the page in storage
+                self.device.write_page(&mut *page)?;
+                self.device.sync()?;
+            }
+            drop(page); // Explicitly drop the borrow
             self.pages.push(wrapper);
-            result
+            Ok(result)
         } else {
-            false
+            // Try to load the page from storage
+            match self.device.read_page(page_id) {
+                Ok(mut page) => {
+                    let result = page.remove_entry(key);
+                    if result {
+                        self.device.write_page(&mut page)?;
+                        self.device.sync()?;
+                    }
+                    self.pages.push(PageWrapper::new(page));
+                    Ok(result)
+                }
+                Err(SsdError::InvalidPageId) => Ok(false),
+                Err(e) => Err(e.into()),
+            }
         }
     }
 
@@ -124,45 +189,65 @@ impl PageManager {
 
     // Get the total capacity across all pages
     pub fn total_capacity(&self) -> usize {
-        self.pages.iter().map(|w| w.page.capacity()).sum()
+        self.pages.iter().map(|w| w.page.borrow().capacity()).sum()
     }
 
     // Get the total used space across all pages
     pub fn total_used_space(&self) -> usize {
-        self.pages.iter().map(|w| w.page.size()).sum()
+        self.pages.iter().map(|w| w.page.borrow().size()).sum()
     }
 
-    // Get a reference to a specific page
-    pub fn get_page(&self, page_id: u64) -> Option<&Page> {
-        self.pages
-            .iter()
-            .find(|w| w.page.id() == page_id)
-            .map(|w| &w.page)
+    // Get a page, returns a shared reference that can be mutably borrowed
+    pub fn get_page(
+        &mut self,
+        page_id: u64,
+    ) -> Result<Option<Rc<RefCell<Page>>>, PageManagerError> {
+        // First try to find in memory
+        for wrapper in &self.pages {
+            if wrapper.page.borrow().id() == page_id {
+                return Ok(Some(Rc::clone(&wrapper.page)));
+            }
+        }
+
+        // If not in memory, try to read from storage
+        match self.device.read_page(page_id) {
+            Ok(page) => {
+                let wrapper = PageWrapper::new(page);
+                let page_rc = Rc::clone(&wrapper.page);
+                self.pages.push(wrapper);
+                Ok(Some(page_rc))
+            }
+            Err(SsdError::InvalidPageId) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     // Get an iterator over all pages
-    pub fn iter_pages(&self) -> impl Iterator<Item = &Page> {
-        self.pages.iter().map(|w| &w.page)
+    pub fn iter_pages(&self) -> impl Iterator<Item = Rc<RefCell<Page>>> + '_ {
+        self.pages.iter().map(|w| Rc::clone(&w.page))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_page_allocation() {
-        let mut manager = PageManager::new(4096);
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.db");
+        let mut manager = PageManager::new(file_path, 4096).unwrap();
 
         // Allocate a small entry
         let key1 = b"key1";
         let value1 = b"value1";
-        let page_id1 = manager.allocate_entry(key1, value1).unwrap();
+        let page_id1 = manager.allocate_entry(key1, value1).unwrap().unwrap();
 
         // Allocate another entry - should use the same page
         let key2 = b"key2";
         let value2 = b"value2";
-        let page_id2 = manager.allocate_entry(key2, value2).unwrap();
+        let page_id2 = manager.allocate_entry(key2, value2).unwrap().unwrap();
 
         assert_eq!(page_id1, page_id2);
         assert_eq!(manager.page_count(), 1);
@@ -170,17 +255,19 @@ mod tests {
 
     #[test]
     fn test_page_removal() {
-        let mut manager = PageManager::new(4096);
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.db");
+        let mut manager = PageManager::new(file_path, 4096).unwrap();
 
         // Add an entry
         let key = b"test_key";
         let value = b"test_value";
-        let page_id = manager.allocate_entry(key, value).unwrap();
+        let page_id = manager.allocate_entry(key, value).unwrap().unwrap();
 
         // Remove the entry
-        assert!(manager.remove_entry(page_id, key));
+        assert!(manager.remove_entry(page_id, key).unwrap());
 
         // Try to remove non-existent entry
-        assert!(!manager.remove_entry(page_id, b"nonexistent"));
+        assert!(!manager.remove_entry(page_id, b"nonexistent").unwrap());
     }
 }
