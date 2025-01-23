@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use tracing::{debug, error, info, instrument, warn};
 
 use super::page::Page;
 
@@ -84,10 +85,13 @@ impl From<io::Error> for SsdError {
 
 impl SsdDevice {
     /// Creates a new SSD device with the specified page size
+    #[instrument(skip(path))]
     pub fn new<P: AsRef<Path>>(path: P, page_size: u32) -> Result<Self, SsdError> {
         if page_size == 0 {
+            error!("Attempted to create SsdDevice with invalid page size: 0");
             return Err(SsdError::InvalidPageSize);
         }
+        info!("Creating new SsdDevice with page_size: {}", page_size);
 
         let file = OpenOptions::new()
             .read(true)
@@ -103,7 +107,9 @@ impl SsdDevice {
     }
 
     /// Reads a page from the device
+    #[instrument(skip(self))]
     pub fn read_page(&mut self, page_id: u64) -> Result<Page, SsdError> {
+        debug!("Reading page {} from device", page_id);
         let offset = self.calculate_offset(page_id);
         self.file.seek(SeekFrom::Start(offset))?;
 
@@ -119,17 +125,32 @@ impl SsdDevice {
 
         if bytes_read == 0 {
             // Create a new empty page if we're reading beyond the file
+            warn!(
+                "Reading beyond file end for page {}, creating empty page",
+                page_id
+            );
             Ok(Page::new(page_id, self.page_size))
         } else {
+            debug!(
+                "Successfully read {} bytes for page {}",
+                bytes_read, page_id
+            );
             Ok(Page::read_from_buffer(&buffer))
         }
     }
 
     /// Writes a page to the device
+    #[instrument(skip(self, page))]
     pub fn write_page(&mut self, page: &mut Page) -> Result<(), SsdError> {
         if page.capacity() as u32 != self.page_size {
+            error!(
+                "Page size mismatch: expected {}, got {}",
+                self.page_size,
+                page.capacity()
+            );
             return Err(SsdError::InvalidPageSize);
         }
+        debug!("Writing page {} to device", page.id());
 
         let offset = self.calculate_offset(page.id());
         self.file.seek(SeekFrom::Start(offset))?;
@@ -148,8 +169,11 @@ impl SsdDevice {
     }
 
     /// Ensures all changes are written to disk
+    #[instrument(skip(self))]
     pub fn sync(&mut self) -> Result<(), SsdError> {
+        debug!("Syncing device to disk");
         self.file.sync_all()?;
+        info!("Device sync completed successfully");
         Ok(())
     }
 

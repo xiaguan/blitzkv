@@ -14,7 +14,6 @@ pub struct Database {
 #[derive(Debug, Copy, Clone)]
 struct Location {
     page_id: u64,
-    page_offset: u32,
 }
 
 #[derive(Debug)]
@@ -36,13 +35,7 @@ impl Database {
         // Try to allocate space for the entry
         if let Some(page_id) = self.page_manager.allocate_entry(key, value) {
             // Update index with new location
-            self.index.insert(
-                key.to_vec(),
-                Location {
-                    page_id,
-                    page_offset: 0,
-                },
-            );
+            self.index.insert(key.to_vec(), Location { page_id });
             Ok(())
         } else {
             Err(DatabaseError::StorageFull)
