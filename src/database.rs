@@ -13,8 +13,8 @@ pub struct Database {
 
 #[derive(Debug, Copy, Clone)]
 struct Location {
-    unit_id: u64,
-    offset: u32,
+    page_id: u64,
+    page_offset: u32,
 }
 
 #[derive(Debug)]
@@ -39,8 +39,8 @@ impl Database {
             self.index.insert(
                 key.to_vec(),
                 Location {
-                    unit_id: page_id,
-                    offset: 0, // Offset is managed internally by Page now
+                    page_id,
+                    page_offset: 0,
                 },
             );
             Ok(())
@@ -53,7 +53,7 @@ impl Database {
         // Look up key in index
         if let Some(location) = self.index.get(key) {
             // Get the page from page manager
-            if let Some(page) = self.page_manager.get_page(location.unit_id) {
+            if let Some(page) = self.page_manager.get_page(location.page_id) {
                 // Iterate through entries to find the matching key
                 for entry in page.iter() {
                     if entry.key() == key {
@@ -69,7 +69,7 @@ impl Database {
 
     pub fn delete(&mut self, key: &[u8]) -> Result<(), DatabaseError> {
         if let Some(location) = self.index.get(key).cloned() {
-            if self.page_manager.remove_entry(location.unit_id, key) {
+            if self.page_manager.remove_entry(location.page_id, key) {
                 self.index.remove(key);
                 Ok(())
             } else {
