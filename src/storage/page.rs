@@ -1,3 +1,4 @@
+use std::alloc::Layout;
 // A Storage unit represents a single storage location capable of holding one item.
 // - For SSDs, a storage unit corresponds to a page.
 // - For object storage, it represents a single object.
@@ -8,6 +9,7 @@
 use std::convert::TryInto;
 use std::slice::Iter;
 
+use aligned_vec::AVec;
 use tracing::info;
 
 const MAGIC_HEADER: &str = "blitzkv";
@@ -62,7 +64,7 @@ const CRC32_SIZE: usize = std::mem::size_of::<u32>();
 const HEADER_SIZE: usize = MAGIC_SIZE + ID_SIZE + SIZE_FIELD_SIZE + CRC32_SIZE;
 
 const ENTRY_METADATA_SIZE: usize = SIZE_FIELD_SIZE * 2; // key_size + value_size + deleted flag
-
+const PAGE_SIZE: usize = 4 * 1024;
 impl PageHeader {
     // Serialize header into a mutable buffer
     fn write_to_buffer(&self, buf: &mut [u8]) -> usize {
@@ -319,15 +321,6 @@ impl Page {
             data,
             current_size: offset,
         }
-    }
-
-    // Serialize entire storage unit and return the buffer
-    pub fn to_bytes(&mut self) -> Vec<u8> {
-        let total_size = self.current_size;
-        let mut buf = vec![0u8; total_size];
-        let bytes_written = self.write_to_buffer(&mut buf);
-        buf.truncate(bytes_written);
-        buf
     }
 
     // Returns an iterator over the entries

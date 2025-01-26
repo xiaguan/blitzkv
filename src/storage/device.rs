@@ -1,12 +1,53 @@
 use hdrhistogram::Histogram;
+use std::alloc::{alloc, dealloc, Layout};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::ptr::NonNull;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 
 use super::page::Page;
+
+const O_DIRECT: i32 = 0o0040000;
+
+struct AlignedBuffer {
+    ptr: NonNull<u8>,
+    size: usize,
+    layout: Layout,
+}
+
+impl AlignedBuffer {
+    /// 创建指定大小的对齐内存缓冲区
+    fn new(size: usize) -> io::Result<Self> {
+        let layout = Layout::from_size_align(size, size)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        // SAFETY: 布局大小不为零
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            return Err(io::Error::new(io::ErrorKind::Other, "Allocation failed"));
+        }
+
+        Ok(Self {
+            ptr: NonNull::new(ptr).unwrap(),
+            size,
+            layout,
+        })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
 
 #[derive(Debug)]
 pub struct SsdDevice {
@@ -159,6 +200,7 @@ impl SsdDevice {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(O_DIRECT)
             .create(true)
             .open(path)?;
 
@@ -175,12 +217,17 @@ impl SsdDevice {
         debug!("Reading page {} from device", page_id);
         let start = Instant::now();
 
+        let mut buffer =
+            AlignedBuffer::new(self.page_size as usize).map_err(|e| SsdError::Io(e))?;
+
         let offset = self.calculate_offset(page_id);
         self.file.seek(SeekFrom::Start(offset))?;
 
-        let mut buffer = vec![0u8; self.page_size as usize];
-        let bytes_read = self.file.read(&mut buffer)?;
-
+        let bytes_read = self
+            .file
+            .read(buffer.as_mut_slice())
+            .map_err(SsdError::Io)?;
+        assert_eq!(bytes_read, self.page_size as usize);
         // Record latency in nanoseconds
         let elapsed_nanos = start.elapsed().as_nanos() as u64;
         self.metrics
@@ -204,7 +251,7 @@ impl SsdDevice {
                 "Successfully read {} bytes for page {}",
                 bytes_read, page_id
             );
-            Ok(Page::read_from_buffer(&buffer))
+            Ok(Page::read_from_buffer(&buffer.as_mut_slice()))
         }
     }
 
@@ -224,10 +271,16 @@ impl SsdDevice {
         let start = Instant::now();
 
         let offset = self.calculate_offset(page.id());
-        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.seek(SeekFrom::Start(offset)).unwrap();
+        info!("offset is {}", offset);
 
-        let buffer = page.to_bytes();
-        let bytes_written = self.file.write(&buffer)?;
+        let size = self.page_size as usize;
+        let layout = Layout::from_size_align(size, size).unwrap();
+        let ptr = unsafe { alloc(layout) as *mut u8 };
+        let mut buffer = unsafe { Vec::from_raw_parts(ptr, size, size) };
+        page.write_to_buffer(&mut buffer);
+        info!("buffer size is {}", buffer.len());
+        let bytes_written = self.file.write(&buffer).unwrap();
 
         // Record latency in nanoseconds
         let elapsed_nanos = start.elapsed().as_nanos() as u64;
@@ -240,6 +293,17 @@ impl SsdDevice {
         self.metrics.writes += 1;
         self.metrics.write_bytes += bytes_written as u64;
         self.sync().unwrap();
+
+        // Manually deallocate the memory
+        unsafe {
+            let ptr = buffer.as_mut_ptr();
+            let capacity = buffer.capacity();
+            std::mem::forget(buffer); // Prevent double-free
+            dealloc(
+                ptr as *mut u8,
+                Layout::from_size_align(capacity, capacity).unwrap(),
+            );
+        }
         Ok(())
     }
 
