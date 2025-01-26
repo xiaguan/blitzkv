@@ -173,7 +173,10 @@ impl SsdDevice {
     pub fn sync(&mut self) -> Result<(), SsdError> {
         debug!("Syncing device to disk");
         self.file.sync_all()?;
-        info!("Device sync completed successfully");
+        info!(
+            "Device sync completed successfully,currenty metrics {}",
+            self.metrics
+        );
         Ok(())
     }
 

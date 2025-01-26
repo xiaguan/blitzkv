@@ -202,12 +202,12 @@ impl PageManager {
         &mut self,
         page_id: u64,
     ) -> Result<Option<Rc<RefCell<Page>>>, PageManagerError> {
-        // First try to find in memory
-        for wrapper in &self.pages {
-            if wrapper.page.borrow().id() == page_id {
-                return Ok(Some(Rc::clone(&wrapper.page)));
-            }
-        }
+        // // First try to find in memory
+        // for wrapper in &self.pages {
+        //     if wrapper.page.borrow().id() == page_id {
+        //         return Ok(Some(Rc::clone(&wrapper.page)));
+        //     }
+        // }
 
         // If not in memory, try to read from storage
         match self.device.read_page(page_id) {
