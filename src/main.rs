@@ -5,8 +5,8 @@ use std::time::Instant;
 use tracing::{error, info, instrument};
 use tracing_subscriber;
 
-const NUM_KEYS: usize = 10_000;
-const TOTAL_OPS: usize = 100_000;
+const NUM_KEYS: usize = 1_000;
+const TOTAL_OPS: usize = 1_000;
 const READ_RATIO: f64 = 0.8; // 80% 读操作
 const UPDATE_RATIO: f64 = 0.15; // 15% 更新操作
 const WRITE_RATIO: f64 = 0.05; // 5% 写入操作
@@ -30,7 +30,7 @@ fn generate_value<R: Rng>(rng: &mut R) -> Vec<u8> {
     (0..value_len).map(|_| rng.gen()).collect()
 }
 
-#[instrument]
+#[instrument(skip(db))]
 fn run_benchmark(db: &mut Database) -> Result<(), DatabaseError> {
     let mut rng = rand::thread_rng();
 

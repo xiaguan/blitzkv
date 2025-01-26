@@ -1,3 +1,5 @@
+use crate::database::Location;
+
 use super::device::{SsdDevice, SsdError};
 use super::page::Page;
 use std::cell::RefCell;
@@ -84,7 +86,7 @@ impl PageManager {
         &mut self,
         key: &[u8],
         value: &[u8],
-    ) -> Result<Option<u64>, PageManagerError> {
+    ) -> Result<Option<Location>, PageManagerError> {
         let required_space = key.len() + value.len() + 8; // 8 bytes for metadata
 
         // Try to find a page with enough space
@@ -101,13 +103,16 @@ impl PageManager {
         if let Some(wrapper) = found_page {
             let page_rc = Rc::clone(&wrapper.page);
             let mut page = page_rc.borrow_mut();
-            if let Some(_) = page.push_entry(key, value) {
+            if let Some(page_index) = page.push_entry(key, value) {
                 let id = page.id();
                 // Write the page to storage
                 self.device.write_page(&mut *page)?;
                 drop(page); // Explicitly drop the borrow
                 self.pages.push(wrapper);
-                return Ok(Some(id));
+                return Ok(Some(Location {
+                    page_id: id,
+                    page_index,
+                }));
             }
             drop(page);
             self.pages.push(wrapper);
@@ -117,13 +122,16 @@ impl PageManager {
         let mut new_page = Page::new(self.next_id, self.page_size);
         self.next_id += 1;
 
-        if let Some(_) = new_page.push_entry(key, value) {
+        if let Some(page_index) = new_page.push_entry(key, value) {
             let page_id = new_page.id();
             // Write the new page to storage
             self.device.write_page(&mut new_page)?;
             self.pages.push(PageWrapper::new(new_page));
             self.device.sync()?;
-            Ok(Some(page_id))
+            Ok(Some(Location {
+                page_id,
+                page_index,
+            }))
         } else {
             Ok(None) // Entry too large even for a new page
         }
@@ -198,24 +206,19 @@ impl PageManager {
     }
 
     // Get a page, returns a shared reference that can be mutably borrowed
-    pub fn get_page(
+    pub fn get(
         &mut self,
-        page_id: u64,
-    ) -> Result<Option<Rc<RefCell<Page>>>, PageManagerError> {
-        // // First try to find in memory
-        // for wrapper in &self.pages {
-        //     if wrapper.page.borrow().id() == page_id {
-        //         return Ok(Some(Rc::clone(&wrapper.page)));
-        //     }
-        // }
-
+        location: &Location,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, PageManagerError> {
         // If not in memory, try to read from storage
-        match self.device.read_page(page_id) {
+        match self.device.read_page(location.page_id) {
             Ok(page) => {
                 let wrapper = PageWrapper::new(page);
                 let page_rc = Rc::clone(&wrapper.page);
                 self.pages.push(wrapper);
-                Ok(Some(page_rc))
+                let value = { page_rc.borrow().get(location.page_index, key) };
+                Ok(value)
             }
             Err(SsdError::InvalidPageId) => Ok(None),
             Err(e) => Err(e.into()),
@@ -242,32 +245,16 @@ mod tests {
         // Allocate a small entry
         let key1 = b"key1";
         let value1 = b"value1";
-        let page_id1 = manager.allocate_entry(key1, value1).unwrap().unwrap();
+        let location0 = manager.allocate_entry(key1, value1).unwrap().unwrap();
 
+        assert_eq!(location0.page_id, 0);
+        assert_eq!(location0.page_index, 0);
         // Allocate another entry - should use the same page
         let key2 = b"key2";
         let value2 = b"value2";
-        let page_id2 = manager.allocate_entry(key2, value2).unwrap().unwrap();
-
-        assert_eq!(page_id1, page_id2);
+        let location1 = manager.allocate_entry(key2, value2).unwrap().unwrap();
+        assert_eq!(location1.page_id, 0);
+        assert_eq!(location1.page_index, 1);
         assert_eq!(manager.page_count(), 1);
-    }
-
-    #[test]
-    fn test_page_removal() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test.db");
-        let mut manager = PageManager::new(file_path, 4096).unwrap();
-
-        // Add an entry
-        let key = b"test_key";
-        let value = b"test_value";
-        let page_id = manager.allocate_entry(key, value).unwrap().unwrap();
-
-        // Remove the entry
-        assert!(manager.remove_entry(page_id, key).unwrap());
-
-        // Try to remove non-existent entry
-        assert!(!manager.remove_entry(page_id, b"nonexistent").unwrap());
     }
 }

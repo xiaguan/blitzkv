@@ -1,3 +1,5 @@
+use tracing::info;
+
 use crate::storage::{PageManager, PageManagerError};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -12,9 +14,10 @@ pub struct Database {
     page_manager: PageManager,
 }
 
-#[derive(Debug, Copy, Clone)]
-struct Location {
-    page_id: u64,
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub page_id: u64,
+    pub page_index: usize,
 }
 
 #[derive(Debug)]
@@ -41,9 +44,14 @@ impl Database {
 
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), DatabaseError> {
         // Try to allocate space for the entry
-        if let Some(page_id) = self.page_manager.allocate_entry(key, value)? {
+        if let Some(location) = self.page_manager.allocate_entry(key, value)? {
             // Update index with new location
-            self.index.insert(key.to_vec(), Location { page_id });
+            info!(
+                "write key {} to location {:?}",
+                String::from_utf8(key.to_vec()).unwrap(),
+                location
+            );
+            self.index.insert(key.to_vec(), location);
             Ok(())
         } else {
             Err(DatabaseError::StorageFull)
@@ -54,13 +62,13 @@ impl Database {
         // Look up key in index
         if let Some(location) = self.index.get(key) {
             // Get the page from page manager
-            if let Some(page) = self.page_manager.get_page(location.page_id)? {
-                // Iterate through entries to find the matching key
-                for entry in page.borrow().iter() {
-                    if entry.key() == key {
-                        return Ok(entry.value().to_vec());
-                    }
-                }
+            info!(
+                "key {} is at {:?}",
+                String::from_utf8(key.to_vec()).unwrap(),
+                location
+            );
+            if let Some(value) = self.page_manager.get(location, key)? {
+                return Ok(value);
             }
             Err(DatabaseError::InvalidData)
         } else {
@@ -165,13 +173,17 @@ mod tests {
         let mut db = Database::new(file_path)?;
 
         // Fill up multiple storage units
-        for i in 0..1000 {
+        for i in 0..10_000 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
             db.set(key.as_bytes(), value.as_bytes())?;
         }
 
-        println!(" {}", db);
+        for i in 0..10_000 {
+            let key = format!("key{}", i);
+            let value = db.get(key.as_bytes())?;
+            assert_eq!(value, format!("value{}", i).as_bytes());
+        }
 
         // random remove some
         for i in 0..1000 {

@@ -8,6 +8,8 @@
 use std::convert::TryInto;
 use std::slice::Iter;
 
+use tracing::info;
+
 const MAGIC_HEADER: &str = "blitzkv";
 
 #[derive(Debug)]
@@ -218,8 +220,8 @@ impl Page {
 
     // Attempt to add an entry to the storage unit
     // Returns the offset of the entry if successful, or None if the entry exceeds the size limit
-    pub fn push_entry(&mut self, key: &[u8], value: &[u8]) -> Option<u32> {
-        let offset = self.current_size as u32;
+    pub fn push_entry(&mut self, key: &[u8], value: &[u8]) -> Option<usize> {
+        let offset = self.data.len();
         let new_size = self.current_size + ENTRY_METADATA_SIZE + key.len() + value.len();
 
         if new_size as u32 > self.header.size {
@@ -236,6 +238,17 @@ impl Page {
         });
         self.current_size = new_size;
         Some(offset)
+    }
+
+    pub fn get(&self, page_index: usize, key: &[u8]) -> Option<Vec<u8>> {
+        self.data.get(page_index).and_then(|entry| {
+            if entry.key() == key {
+                Some(entry.value().to_vec())
+            } else {
+                info!("key is not match");
+                None
+            }
+        })
     }
 
     // Serialize entire storage unit into a buffer

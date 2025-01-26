@@ -233,7 +233,7 @@ impl SsdDevice {
         // Update metrics
         self.metrics.writes += 1;
         self.metrics.write_bytes += bytes_written as u64;
-
+        self.sync().unwrap();
         Ok(())
     }
 
@@ -242,10 +242,6 @@ impl SsdDevice {
     pub fn sync(&mut self) -> Result<(), SsdError> {
         debug!("Syncing device to disk");
         self.file.sync_all()?;
-        info!(
-            "Device sync completed successfully,currenty metrics {}",
-            self.metrics
-        );
         Ok(())
     }
 
