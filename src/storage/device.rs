@@ -215,14 +215,13 @@ impl SsdDevice {
     #[instrument(skip(self))]
     pub fn read_page(&mut self, page_id: u64) -> Result<Page, SsdError> {
         debug!("Reading page {} from device", page_id);
-        let start = Instant::now();
 
         let mut buffer =
             AlignedBuffer::new(self.page_size as usize).map_err(|e| SsdError::Io(e))?;
 
         let offset = self.calculate_offset(page_id);
         self.file.seek(SeekFrom::Start(offset))?;
-
+        let start = Instant::now();
         let bytes_read = self
             .file
             .read(buffer.as_mut_slice())
@@ -268,8 +267,6 @@ impl SsdDevice {
         }
         debug!("Writing page {} to device", page.id());
 
-        let start = Instant::now();
-
         let offset = self.calculate_offset(page.id());
         self.file.seek(SeekFrom::Start(offset)).unwrap();
         info!("offset is {}", offset);
@@ -280,8 +277,8 @@ impl SsdDevice {
         let mut buffer = unsafe { Vec::from_raw_parts(ptr, size, size) };
         page.write_to_buffer(&mut buffer);
         info!("buffer size is {}", buffer.len());
+        let start = Instant::now();
         let bytes_written = self.file.write(&buffer).unwrap();
-
         // Record latency in nanoseconds
         let elapsed_nanos = start.elapsed().as_nanos() as u64;
         self.metrics
