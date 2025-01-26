@@ -1,7 +1,9 @@
+use hdrhistogram::Histogram;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 
 use super::page::Page;
@@ -13,14 +15,26 @@ pub struct SsdDevice {
     metrics: SsdMetrics,
 }
 
-#[derive(Debug, Default)]
 pub struct SsdMetrics {
     reads: u64,
     writes: u64,
     read_bytes: u64,
     write_bytes: u64,
-    read_amplification: f64,
-    write_amplification: f64,
+    read_latency_hist: Histogram<u64>,
+    write_latency_hist: Histogram<u64>,
+}
+
+impl Default for SsdMetrics {
+    fn default() -> Self {
+        Self {
+            reads: 0,
+            writes: 0,
+            read_bytes: 0,
+            write_bytes: 0,
+            read_latency_hist: Histogram::<u64>::new(3).unwrap(), // 3 significant figures
+            write_latency_hist: Histogram::<u64>::new(3).unwrap(),
+        }
+    }
 }
 
 impl fmt::Display for SsdMetrics {
@@ -32,15 +46,58 @@ impl fmt::Display for SsdMetrics {
   Writes: {}
   Read Bytes: {}
   Write Bytes: {}
-  Read Amplification: {:.2}
-  Write Amplification: {:.2}",
+  Read Latency (μs):
+    p50: {:.2}
+    p95: {:.2}
+    p99: {:.2}
+    max: {:.2}
+  Write Latency (μs):
+    p50: {:.2}
+    p95: {:.2}
+    p99: {:.2}
+    max: {:.2}",
             self.reads,
             self.writes,
             self.read_bytes,
             self.write_bytes,
-            self.read_amplification,
-            self.write_amplification
+            self.read_latency_hist.value_at_percentile(50.0) as f64 / 1000.0,
+            self.read_latency_hist.value_at_percentile(95.0) as f64 / 1000.0,
+            self.read_latency_hist.value_at_percentile(99.0) as f64 / 1000.0,
+            self.read_latency_hist.max() as f64 / 1000.0,
+            self.write_latency_hist.value_at_percentile(50.0) as f64 / 1000.0,
+            self.write_latency_hist.value_at_percentile(95.0) as f64 / 1000.0,
+            self.write_latency_hist.value_at_percentile(99.0) as f64 / 1000.0,
+            self.write_latency_hist.max() as f64 / 1000.0,
         )
+    }
+}
+
+impl fmt::Debug for SsdMetrics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SsdMetrics")
+            .field("reads", &self.reads)
+            .field("writes", &self.writes)
+            .field("read_bytes", &self.read_bytes)
+            .field("write_bytes", &self.write_bytes)
+            .field(
+                "read_latency_hist (p50, p95, p99, max)",
+                &(
+                    self.read_latency_hist.value_at_percentile(50.0),
+                    self.read_latency_hist.value_at_percentile(95.0),
+                    self.read_latency_hist.value_at_percentile(99.0),
+                    self.read_latency_hist.max(),
+                ),
+            )
+            .field(
+                "write_latency_hist (p50, p95, p99, max)",
+                &(
+                    self.write_latency_hist.value_at_percentile(50.0),
+                    self.write_latency_hist.value_at_percentile(95.0),
+                    self.write_latency_hist.value_at_percentile(99.0),
+                    self.write_latency_hist.max(),
+                ),
+            )
+            .finish()
     }
 }
 
@@ -61,12 +118,12 @@ impl SsdMetrics {
         self.write_bytes
     }
 
-    pub fn read_amplification(&self) -> f64 {
-        self.read_amplification
+    pub fn read_latency_percentile(&self, percentile: f64) -> f64 {
+        self.read_latency_hist.value_at_percentile(percentile) as f64 / 1000.0
     }
 
-    pub fn write_amplification(&self) -> f64 {
-        self.write_amplification
+    pub fn write_latency_percentile(&self, percentile: f64) -> f64 {
+        self.write_latency_hist.value_at_percentile(percentile) as f64 / 1000.0
     }
 }
 
@@ -110,18 +167,24 @@ impl SsdDevice {
     #[instrument(skip(self))]
     pub fn read_page(&mut self, page_id: u64) -> Result<Page, SsdError> {
         debug!("Reading page {} from device", page_id);
+        let start = Instant::now();
+
         let offset = self.calculate_offset(page_id);
         self.file.seek(SeekFrom::Start(offset))?;
 
         let mut buffer = vec![0u8; self.page_size as usize];
         let bytes_read = self.file.read(&mut buffer)?;
 
+        // Record latency in nanoseconds
+        let elapsed_nanos = start.elapsed().as_nanos() as u64;
+        self.metrics
+            .read_latency_hist
+            .record(elapsed_nanos)
+            .unwrap();
+
         // Update metrics
         self.metrics.reads += 1;
         self.metrics.read_bytes += bytes_read as u64;
-        if bytes_read > 0 {
-            self.metrics.read_amplification = self.page_size as f64 / bytes_read as f64;
-        }
 
         if bytes_read == 0 {
             // Create a new empty page if we're reading beyond the file
@@ -152,18 +215,24 @@ impl SsdDevice {
         }
         debug!("Writing page {} to device", page.id());
 
+        let start = Instant::now();
+
         let offset = self.calculate_offset(page.id());
         self.file.seek(SeekFrom::Start(offset))?;
 
         let buffer = page.to_bytes();
         let bytes_written = self.file.write(&buffer)?;
 
+        // Record latency in nanoseconds
+        let elapsed_nanos = start.elapsed().as_nanos() as u64;
+        self.metrics
+            .write_latency_hist
+            .record(elapsed_nanos)
+            .unwrap();
+
         // Update metrics
         self.metrics.writes += 1;
         self.metrics.write_bytes += bytes_written as u64;
-        if bytes_written > 0 {
-            self.metrics.write_amplification = self.page_size as f64 / bytes_written as f64;
-        }
 
         Ok(())
     }
