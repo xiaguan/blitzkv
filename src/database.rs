@@ -44,7 +44,7 @@ impl Database {
 
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), DatabaseError> {
         // Try to allocate space for the entry
-        if let Some(location) = self.page_manager.allocate_entry(key, value)? {
+        if let Some(location) = self.page_manager.set(key, value)? {
             // Update index with new location
             info!(
                 "write key {} to location {:?}",
@@ -78,7 +78,7 @@ impl Database {
 
     pub fn delete(&mut self, key: &[u8]) -> Result<(), DatabaseError> {
         if let Some(location) = self.index.get(key).cloned() {
-            if self.page_manager.remove_entry(location.page_id, key)? {
+            if self.page_manager.delete(location.page_id, key)? {
                 self.index.remove(key);
                 Ok(())
             } else {
@@ -103,32 +103,6 @@ impl Database {
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
     }
-
-    // Get total size of all pages
-    pub fn total_size(&self) -> usize {
-        self.page_manager.total_used_space()
-    }
-
-    // Get total capacity of all pages
-    pub fn total_capacity(&self) -> usize {
-        self.page_manager.total_capacity()
-    }
-
-    // Calculate overall space amplification
-    pub fn space_amplification(&self) -> f64 {
-        let total_size = self.total_size() as f64;
-        let data_size = self.index.len() as f64; // Simplified - actual data size would need key/value sizes
-        total_size / data_size
-    }
-}
-
-impl std::fmt::Display for Database {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        for page in self.page_manager.iter_pages() {
-            write!(f, "{}\n", page.borrow())?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -147,7 +121,6 @@ mod tests {
         db.set(b"key1", b"value1")?;
         db.set(b"key2", b"value2")?;
 
-        println!(" {}", db);
         // Test get
         assert_eq!(db.get(b"key1")?, b"value1");
         assert_eq!(db.get(b"key2")?, b"value2");
@@ -193,7 +166,6 @@ mod tests {
             }
         }
 
-        println!(" {}", db);
         Ok(())
     }
 }

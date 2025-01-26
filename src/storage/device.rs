@@ -15,6 +15,12 @@ pub struct SsdDevice {
     metrics: SsdMetrics,
 }
 
+impl Drop for SsdDevice {
+    fn drop(&mut self) {
+        info!("Dropping SsdDevice with metrics:\n{}", self.metrics);
+    }
+}
+
 pub struct SsdMetrics {
     reads: u64,
     writes: u64,
@@ -239,7 +245,7 @@ impl SsdDevice {
 
     /// Ensures all changes are written to disk
     #[instrument(skip(self))]
-    pub fn sync(&mut self) -> Result<(), SsdError> {
+    fn sync(&mut self) -> Result<(), SsdError> {
         debug!("Syncing device to disk");
         self.file.sync_all()?;
         Ok(())
