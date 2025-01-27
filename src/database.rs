@@ -1,4 +1,4 @@
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::storage::{PageManager, PageManagerError};
 use std::collections::BTreeMap;
