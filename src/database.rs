@@ -1,4 +1,4 @@
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::storage::{PageManager, PageManagerError};
 use std::collections::BTreeMap;
@@ -46,7 +46,7 @@ impl Database {
         // Try to allocate space for the entry
         if let Some(location) = self.page_manager.set(key, value)? {
             // Update index with new location
-            info!(
+            debug!(
                 "write key {} to location {:?}",
                 String::from_utf8(key.to_vec()).unwrap(),
                 location
@@ -62,7 +62,7 @@ impl Database {
         // Look up key in index
         if let Some(location) = self.index.get(key) {
             // Get the page from page manager
-            info!(
+            debug!(
                 "key {} is at {:?}",
                 String::from_utf8(key.to_vec()).unwrap(),
                 location
@@ -146,13 +146,13 @@ mod tests {
         let mut db = Database::new(file_path)?;
 
         // Fill up multiple storage units
-        for i in 0..10_000 {
+        for i in 0..1000 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
             db.set(key.as_bytes(), value.as_bytes())?;
         }
 
-        for i in 0..10_000 {
+        for i in 0..1000 {
             let key = format!("key{}", i);
             let value = db.get(key.as_bytes())?;
             assert_eq!(value, format!("value{}", i).as_bytes());

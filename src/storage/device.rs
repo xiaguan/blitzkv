@@ -269,14 +269,12 @@ impl SsdDevice {
 
         let offset = self.calculate_offset(page.id());
         self.file.seek(SeekFrom::Start(offset)).unwrap();
-        info!("offset is {}", offset);
 
         let size = self.page_size as usize;
         let layout = Layout::from_size_align(size, size).unwrap();
         let ptr = unsafe { alloc(layout) as *mut u8 };
         let mut buffer = unsafe { Vec::from_raw_parts(ptr, size, size) };
         page.write_to_buffer(&mut buffer);
-        info!("buffer size is {}", buffer.len());
         let start = Instant::now();
         let bytes_written = self.file.write(&buffer).unwrap();
         // Record latency in nanoseconds
