@@ -5,7 +5,6 @@ pub mod io_uring;
 mod lazy;
 mod metrics;
 pub mod page;
-pub mod page_manager;
 
 /// Create a new IO system.
 pub fn new() -> std::io::Result<Rio> {
@@ -55,4 +54,3 @@ impl FromCqe for () {
 }
 
 use io_uring::{Config, Rio};
-pub use page_manager::{PageManager, PageManagerError};
