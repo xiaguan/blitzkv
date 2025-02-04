@@ -13,3 +13,35 @@ SsdMetrics:
     p95: 33.76
     p99: 43.36
     max: 371.45
+
+SsdMetrics:
+  Reads: 23275
+  Writes: 30010
+  Read Bytes: 95334400
+  Write Bytes: 122920960
+  Read Latency (μs):
+    p50: 47.17
+    p95: 89.41
+    p99: 96.89
+    max: 896.51
+  Write Latency (μs):
+    p50: 27.89
+    p95: 93.12
+    p99: 104.38
+    max: 178.94
+
+SsdMetrics:
+  Reads: 23275
+  Writes: 30010
+  Read Bytes: 95334400
+  Write Bytes: 122920960
+  Read Latency (μs):
+    p50: 47.17
+    p95: 89.41
+    p99: 96.89
+    max: 896.51
+  Write Latency (μs):
+    p50: 27.89
+    p95: 93.12
+    p99: 104.38
+    max: 178.94

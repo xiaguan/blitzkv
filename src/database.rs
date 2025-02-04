@@ -23,13 +23,14 @@ pub struct ObjectMetadata {
 pub struct Location {
     pub page_id: u64,
     pub page_index: usize,
+    pub is_young: bool, // Indicates if this is a frequently accessed page (freq >= 2)
 }
 
 /// Represents the status of a page, either cached in memory or only stored on SSD.
 #[derive(Debug)]
 enum PageStatus {
-    Memory(Rc<RefCell<Page>>),
-    Ssd, // Indicates the page is only on SSD.
+    Memory(Rc<RefCell<Page>>, bool), // bool indicates if it's a young page
+    Ssd,                             // Indicates the page is only on SSD.
 }
 
 /// Errors related to page management operations.
@@ -84,15 +85,19 @@ impl PageManager {
 
     /// Ensure that the page with the given ID is loaded into memory.
     /// If the page is only on SSD, load it and cache it.
-    fn ensure_page_loaded(&mut self, page_id: u64) -> Result<Rc<RefCell<Page>>, PageManagerError> {
+    fn ensure_page_loaded(
+        &mut self,
+        page_id: u64,
+        is_young: bool,
+    ) -> Result<Rc<RefCell<Page>>, PageManagerError> {
         match self.pages.get(&page_id) {
-            Some(PageStatus::Memory(page)) => Ok(Rc::clone(page)),
+            Some(PageStatus::Memory(page, _)) => Ok(Rc::clone(page)),
             Some(PageStatus::Ssd) | None => {
-                debug!("Loading page {} from SSD", page_id);
+                debug!("Loading page {} from SSD (young: {})", page_id, is_young);
                 let page = self.device.read_page(page_id)?;
                 let rc_page = Rc::new(RefCell::new(page));
                 self.pages
-                    .insert(page_id, PageStatus::Memory(Rc::clone(&rc_page)));
+                    .insert(page_id, PageStatus::Memory(Rc::clone(&rc_page), is_young));
                 Ok(rc_page)
             }
         }
@@ -105,12 +110,16 @@ impl PageManager {
         &mut self,
         key: &[u8],
         value: &[u8],
+        is_young: bool,
     ) -> Result<Option<Location>, PageManagerError> {
         let required_space = key.len() + value.len() + 8; // 8 bytes reserved for metadata
 
-        // Attempt to add the entry to an existing memory-cached page.
+        // First try to find a page with matching young/old status
         for (&page_id, status) in self.pages.iter() {
-            if let PageStatus::Memory(page_rc) = status {
+            if let PageStatus::Memory(page_rc, page_is_young) = status {
+                if *page_is_young != is_young {
+                    continue; // Skip pages with different young/old status
+                }
                 let mut page = page_rc.borrow_mut();
                 let available_space = page.capacity() - page.size();
                 if available_space >= required_space {
@@ -120,6 +129,7 @@ impl PageManager {
                         return Ok(Some(Location {
                             page_id,
                             page_index,
+                            is_young,
                         }));
                     }
                 }
@@ -132,12 +142,15 @@ impl PageManager {
         if let Some(page_index) = new_page.push_entry(key, value) {
             info!("Creating new page {} for entry", page_id);
             self.device.write_page(&mut new_page)?;
-            self.pages
-                .insert(page_id, PageStatus::Memory(Rc::new(RefCell::new(new_page))));
+            self.pages.insert(
+                page_id,
+                PageStatus::Memory(Rc::new(RefCell::new(new_page)), is_young),
+            );
             self.next_id += 1;
             return Ok(Some(Location {
                 page_id,
                 page_index,
+                is_young,
             }));
         }
 
@@ -151,8 +164,13 @@ impl PageManager {
 
     /// Public method to insert an entry.
     /// After writing to the page, marks the page as flushed to SSD.
-    pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<Option<Location>, PageManagerError> {
-        let location = self.set_inner(key, value)?;
+    pub fn set(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        is_young: bool,
+    ) -> Result<Option<Location>, PageManagerError> {
+        let location = self.set_inner(key, value, is_young)?;
         if let Some(loc) = location {
             // Mark the page as flushed to SSD to indicate it is not actively cached.
             self.pages.insert(loc.page_id, PageStatus::Ssd);
@@ -161,8 +179,13 @@ impl PageManager {
     }
 
     /// Delete an entry from the specified page.
-    pub fn delete(&mut self, page_id: u64, key: &[u8]) -> Result<bool, PageManagerError> {
-        let page_rc = self.ensure_page_loaded(page_id)?;
+    pub fn delete(
+        &mut self,
+        page_id: u64,
+        key: &[u8],
+        is_young: bool,
+    ) -> Result<bool, PageManagerError> {
+        let page_rc = self.ensure_page_loaded(page_id, is_young)?;
         let mut page = page_rc.borrow_mut();
         if page.remove_entry(key) {
             info!("Deleted key from page {}", page_id);
@@ -180,7 +203,7 @@ impl PageManager {
         location: &Location,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, PageManagerError> {
-        let page_rc = self.ensure_page_loaded(location.page_id)?;
+        let page_rc = self.ensure_page_loaded(location.page_id, location.is_young)?;
         let page = page_rc.borrow();
         Ok(page.get(location.page_index, key))
     }
@@ -221,7 +244,9 @@ impl Database {
                 );
             }
         }
-        match self.page_manager.set(key, value)? {
+        // Determine if this is a young page based on frequency
+        let is_young = self.index.get(key).map_or(false, |m| m.freq_accessed >= 2);
+        match self.page_manager.set(key, value, is_young)? {
             Some(location) => {
                 debug!(
                     "Writing key '{}' to location {:?}",
@@ -276,7 +301,11 @@ impl Database {
     /// Delete a key-value pair from the database.
     pub fn delete(&mut self, key: &[u8]) -> Result<(), DatabaseError> {
         if let Some(metadata) = self.index.get(key) {
-            if self.page_manager.delete(metadata.location.page_id, key)? {
+            if self.page_manager.delete(
+                metadata.location.page_id,
+                key,
+                metadata.location.is_young,
+            )? {
                 debug!(
                     "Deleted key '{}' from database",
                     String::from_utf8_lossy(key)
