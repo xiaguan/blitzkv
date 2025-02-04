@@ -10,6 +10,14 @@ use crate::storage::page::Page;
 
 const DEFAULT_PAGE_SIZE: u32 = 4096; // 4KB page size
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ObjectMetadata {
+    pub location: Location, // Location of the object in the page
+    pub size: u32,          // Size of the object in bytes
+    pub last_accessed: u64, // Timestamp of the last access
+    pub freq_accessed: u32, // Frequency of access
+}
+
 /// Represents the location of an entry in a page.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Location {
@@ -80,7 +88,7 @@ impl PageManager {
         match self.pages.get(&page_id) {
             Some(PageStatus::Memory(page)) => Ok(Rc::clone(page)),
             Some(PageStatus::Ssd) | None => {
-                info!("Loading page {} from SSD", page_id);
+                debug!("Loading page {} from SSD", page_id);
                 let page = self.device.read_page(page_id)?;
                 let rc_page = Rc::new(RefCell::new(page));
                 self.pages
@@ -107,7 +115,7 @@ impl PageManager {
                 let available_space = page.capacity() - page.size();
                 if available_space >= required_space {
                     if let Some(page_index) = page.push_entry(key, value) {
-                        info!("Added entry to existing page {}", page_id);
+                        debug!("Added entry to existing page {}", page_id);
                         self.device.write_page(&mut page)?;
                         return Ok(Some(Location {
                             page_id,
@@ -181,8 +189,8 @@ impl PageManager {
 /// A simple key-value database that uses PageManager for storage.
 #[derive(Debug)]
 pub struct Database {
-    /// In-memory index mapping keys to their location in storage.
-    index: BTreeMap<Vec<u8>, Location>,
+    /// In-memory index mapping keys to their metadata including storage location.
+    index: BTreeMap<Vec<u8>, ObjectMetadata>,
     /// Manages pages stored on SSD.
     page_manager: PageManager,
 }
@@ -202,6 +210,17 @@ impl Database {
 
     /// Insert or update a key-value pair in the database.
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), DatabaseError> {
+        // Attemtp to get the current metadata for the key.
+        if let Some(metadata) = self.index.get_mut(key) {
+            // If the key already exists, update its metadata.
+            metadata.freq_accessed += 1;
+            if metadata.freq_accessed > 2 {
+                info!(
+                    "Key '{}' is hot, moving to faster storage",
+                    String::from_utf8_lossy(key)
+                );
+            }
+        }
         match self.page_manager.set(key, value)? {
             Some(location) => {
                 debug!(
@@ -209,7 +228,16 @@ impl Database {
                     String::from_utf8_lossy(key),
                     location
                 );
-                self.index.insert(key.to_vec(), location);
+                let metadata = ObjectMetadata {
+                    location,
+                    size: (key.len() + value.len()) as u32,
+                    last_accessed: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    freq_accessed: 1,
+                };
+                self.index.insert(key.to_vec(), metadata);
                 Ok(())
             }
             None => {
@@ -224,13 +252,19 @@ impl Database {
 
     /// Retrieve the value associated with a key.
     pub fn get(&mut self, key: &[u8]) -> Result<Vec<u8>, DatabaseError> {
-        if let Some(&location) = self.index.get(key) {
+        if let Some(metadata) = self.index.get_mut(key) {
+            // Update access statistics
+            metadata.last_accessed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            metadata.freq_accessed += 1;
             debug!(
                 "Retrieving key '{}' from location {:?}",
                 String::from_utf8_lossy(key),
-                location
+                metadata.location
             );
-            if let Some(value) = self.page_manager.get(&location, key)? {
+            if let Some(value) = self.page_manager.get(&metadata.location, key)? {
                 return Ok(value);
             }
             Err(DatabaseError::InvalidData)
@@ -241,8 +275,8 @@ impl Database {
 
     /// Delete a key-value pair from the database.
     pub fn delete(&mut self, key: &[u8]) -> Result<(), DatabaseError> {
-        if let Some(location) = self.index.get(key).cloned() {
-            if self.page_manager.delete(location.page_id, key)? {
+        if let Some(metadata) = self.index.get(key) {
+            if self.page_manager.delete(metadata.location.page_id, key)? {
                 debug!(
                     "Deleted key '{}' from database",
                     String::from_utf8_lossy(key)
