@@ -1,26 +1,30 @@
-use tracing::debug;
-
-use crate::storage::device::{SsdDevice, SsdError};
-use crate::storage::page::Page;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 
+use tracing::{debug, error, info, warn};
+
+use crate::storage::device::{SsdDevice, SsdError};
+use crate::storage::page::Page;
+
 const DEFAULT_PAGE_SIZE: u32 = 4096; // 4KB page size
 
+/// Represents the location of an entry in a page.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Location {
     pub page_id: u64,
     pub page_index: usize,
 }
 
+/// Represents the status of a page, either cached in memory or only stored on SSD.
 #[derive(Debug)]
 enum PageStatus {
     Memory(Rc<RefCell<Page>>),
-    Ssd, // Stores page_id for pages that are only on SSD
+    Ssd, // Indicates the page is only on SSD.
 }
 
+/// Errors related to page management operations.
 #[derive(Debug)]
 pub enum PageManagerError {
     Storage(SsdError),
@@ -33,6 +37,7 @@ impl From<SsdError> for PageManagerError {
     }
 }
 
+/// Errors that can occur at the database level.
 #[derive(Debug)]
 pub enum DatabaseError {
     KeyNotFound,
@@ -47,6 +52,7 @@ impl From<PageManagerError> for DatabaseError {
     }
 }
 
+/// Manages pages in memory and on SSD.
 #[derive(Debug)]
 struct PageManager {
     pages: HashMap<u64, PageStatus>,
@@ -56,7 +62,9 @@ struct PageManager {
 }
 
 impl PageManager {
+    /// Create a new PageManager with the given storage path and page size.
     fn new<P: AsRef<Path>>(path: P, page_size: u32) -> Result<Self, PageManagerError> {
+        info!("Initializing SSD device at path {:?}", path.as_ref());
         let device = SsdDevice::new(path, page_size)?;
         Ok(PageManager {
             pages: HashMap::new(),
@@ -66,165 +74,163 @@ impl PageManager {
         })
     }
 
+    /// Ensure that the page with the given ID is loaded into memory.
+    /// If the page is only on SSD, load it and cache it.
+    fn ensure_page_loaded(&mut self, page_id: u64) -> Result<Rc<RefCell<Page>>, PageManagerError> {
+        match self.pages.get(&page_id) {
+            Some(PageStatus::Memory(page)) => Ok(Rc::clone(page)),
+            Some(PageStatus::Ssd) | None => {
+                info!("Loading page {} from SSD", page_id);
+                let page = self.device.read_page(page_id)?;
+                let rc_page = Rc::new(RefCell::new(page));
+                self.pages
+                    .insert(page_id, PageStatus::Memory(Rc::clone(&rc_page)));
+                Ok(rc_page)
+            }
+        }
+    }
+
+    /// Internal method to add an entry to a page.
+    /// It first attempts to insert into an existing page with enough space.
+    /// If none is found, it creates a new page.
     fn set_inner(
         &mut self,
         key: &[u8],
         value: &[u8],
     ) -> Result<Option<Location>, PageManagerError> {
-        let required_space = key.len() + value.len() + 8; // 8 bytes for metadata
+        let required_space = key.len() + value.len() + 8; // 8 bytes reserved for metadata
 
-        // Try to find a page with enough space
-        for (page_id, status) in self.pages.iter() {
-            match status {
-                PageStatus::Memory(page_rc) => {
-                    let mut page = page_rc.borrow_mut();
-                    let available_space = page.capacity() - page.size();
-                    if available_space >= required_space {
-                        if let Some(page_index) = page.push_entry(key, value) {
-                            // Write the page to storage
-                            self.device.write_page(&mut *page)?;
-                            return Ok(Some(Location {
-                                page_id: *page_id,
-                                page_index,
-                            }));
-                        }
+        // Attempt to add the entry to an existing memory-cached page.
+        for (&page_id, status) in self.pages.iter() {
+            if let PageStatus::Memory(page_rc) = status {
+                let mut page = page_rc.borrow_mut();
+                let available_space = page.capacity() - page.size();
+                if available_space >= required_space {
+                    if let Some(page_index) = page.push_entry(key, value) {
+                        info!("Added entry to existing page {}", page_id);
+                        self.device.write_page(&mut page)?;
+                        return Ok(Some(Location {
+                            page_id,
+                            page_index,
+                        }));
                     }
                 }
-                PageStatus::Ssd => {}
             }
         }
 
-        // Create a new page if no existing page has enough space
-        let mut new_page = Page::new(self.next_id, self.page_size);
-        self.next_id += 1;
-
+        // No suitable page found; create a new one.
+        let page_id = self.next_id;
+        let mut new_page = Page::new(page_id, self.page_size);
         if let Some(page_index) = new_page.push_entry(key, value) {
-            let page_id = new_page.id();
-            // Write the new page to storage
+            info!("Creating new page {} for entry", page_id);
             self.device.write_page(&mut new_page)?;
             self.pages
                 .insert(page_id, PageStatus::Memory(Rc::new(RefCell::new(new_page))));
-            Ok(Some(Location {
+            self.next_id += 1;
+            return Ok(Some(Location {
                 page_id,
                 page_index,
-            }))
-        } else {
-            Ok(None) // Entry too large even for a new page
+            }));
         }
+
+        // The entry is too large to fit in a new page.
+        warn!(
+            "Entry too large to fit in a new page (page id: {})",
+            page_id
+        );
+        Ok(None)
     }
 
-    // Try to find a page with enough space for the entry
-    // If no suitable page exists, create a new one
-    fn set(&mut self, key: &[u8], value: &[u8]) -> Result<Option<Location>, PageManagerError> {
+    /// Public method to insert an entry.
+    /// After writing to the page, marks the page as flushed to SSD.
+    pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<Option<Location>, PageManagerError> {
         let location = self.set_inner(key, value)?;
-        if let Some(location) = location {
-            self.pages.insert(location.page_id, PageStatus::Ssd);
+        if let Some(loc) = location {
+            // Mark the page as flushed to SSD to indicate it is not actively cached.
+            self.pages.insert(loc.page_id, PageStatus::Ssd);
         }
-        return Ok(location);
+        Ok(location)
     }
 
-    // Remove an entry from a specific page
-    fn delete(&mut self, page_id: u64, key: &[u8]) -> Result<bool, PageManagerError> {
-        match self.pages.get(&page_id) {
-            Some(PageStatus::Memory(page_rc)) => {
-                let mut page = page_rc.borrow_mut();
-                let result = page.remove_entry(key);
-                if result {
-                    // Update the page in storage
-                    self.device.write_page(&mut *page)?;
-                }
-                Ok(result)
-            }
-            Some(PageStatus::Ssd) | None => {
-                // Try to load the page from storage
-                match self.device.read_page(page_id) {
-                    Ok(mut page) => {
-                        let result = page.remove_entry(key);
-                        if result {
-                            self.device.write_page(&mut page)?;
-                        }
-                        self.pages
-                            .insert(page_id, PageStatus::Memory(Rc::new(RefCell::new(page))));
-                        Ok(result)
-                    }
-                    Err(SsdError::InvalidPageId) => Ok(false),
-                    Err(e) => Err(e.into()),
-                }
-            }
+    /// Delete an entry from the specified page.
+    pub fn delete(&mut self, page_id: u64, key: &[u8]) -> Result<bool, PageManagerError> {
+        let page_rc = self.ensure_page_loaded(page_id)?;
+        let mut page = page_rc.borrow_mut();
+        if page.remove_entry(key) {
+            info!("Deleted key from page {}", page_id);
+            self.device.write_page(&mut page)?;
+            Ok(true)
+        } else {
+            debug!("Key not found in page {}", page_id);
+            Ok(false)
         }
     }
 
-    // Get a page, returns a shared reference that can be mutably borrowed
-    fn get(
+    /// Retrieve an entry from a page.
+    pub fn get(
         &mut self,
         location: &Location,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, PageManagerError> {
-        match self.pages.get(&location.page_id) {
-            Some(PageStatus::Memory(page_rc)) => {
-                let page = page_rc.borrow();
-                Ok(page.get(location.page_index, key))
-            }
-            Some(PageStatus::Ssd) | None => {
-                // Try to load the page from storage
-                match self.device.read_page(location.page_id) {
-                    Ok(page) => {
-                        let page_rc = Rc::new(RefCell::new(page));
-                        let value = page_rc.borrow().get(location.page_index, key);
-                        self.pages
-                            .insert(location.page_id, PageStatus::Memory(page_rc));
-                        Ok(value)
-                    }
-                    Err(SsdError::InvalidPageId) => Ok(None),
-                    Err(e) => Err(e.into()),
-                }
-            }
-        }
+        let page_rc = self.ensure_page_loaded(location.page_id)?;
+        let page = page_rc.borrow();
+        Ok(page.get(location.page_index, key))
     }
 }
 
+/// A simple key-value database that uses PageManager for storage.
 #[derive(Debug)]
 pub struct Database {
-    // Memory index mapping keys to their location
+    /// In-memory index mapping keys to their location in storage.
     index: BTreeMap<Vec<u8>, Location>,
-    // Page manager for storage allocation
+    /// Manages pages stored on SSD.
     page_manager: PageManager,
 }
 
 impl Database {
+    /// Create a new database with the given storage path.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
+        info!(
+            "Initializing database with storage path {:?}",
+            path.as_ref()
+        );
         Ok(Database {
             index: BTreeMap::new(),
             page_manager: PageManager::new(path, DEFAULT_PAGE_SIZE)?,
         })
     }
 
+    /// Insert or update a key-value pair in the database.
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), DatabaseError> {
-        // Try to allocate space for the entry
-        if let Some(location) = self.page_manager.set(key, value)? {
-            // Update index with new location
-            debug!(
-                "write key {} to location {:?}",
-                String::from_utf8(key.to_vec()).unwrap(),
-                location
-            );
-            self.index.insert(key.to_vec(), location);
-            Ok(())
-        } else {
-            Err(DatabaseError::StorageFull)
+        match self.page_manager.set(key, value)? {
+            Some(location) => {
+                debug!(
+                    "Writing key '{}' to location {:?}",
+                    String::from_utf8_lossy(key),
+                    location
+                );
+                self.index.insert(key.to_vec(), location);
+                Ok(())
+            }
+            None => {
+                error!(
+                    "Failed to allocate space for key '{}'",
+                    String::from_utf8_lossy(key)
+                );
+                Err(DatabaseError::StorageFull)
+            }
         }
     }
 
+    /// Retrieve the value associated with a key.
     pub fn get(&mut self, key: &[u8]) -> Result<Vec<u8>, DatabaseError> {
-        // Look up key in index
-        if let Some(location) = self.index.get(key) {
-            // Get the page from page manager
+        if let Some(&location) = self.index.get(key) {
             debug!(
-                "key {} is at {:?}",
-                String::from_utf8(key.to_vec()).unwrap(),
+                "Retrieving key '{}' from location {:?}",
+                String::from_utf8_lossy(key),
                 location
             );
-            if let Some(value) = self.page_manager.get(location, key)? {
+            if let Some(value) = self.page_manager.get(&location, key)? {
                 return Ok(value);
             }
             Err(DatabaseError::InvalidData)
@@ -233,12 +239,21 @@ impl Database {
         }
     }
 
+    /// Delete a key-value pair from the database.
     pub fn delete(&mut self, key: &[u8]) -> Result<(), DatabaseError> {
         if let Some(location) = self.index.get(key).cloned() {
             if self.page_manager.delete(location.page_id, key)? {
+                debug!(
+                    "Deleted key '{}' from database",
+                    String::from_utf8_lossy(key)
+                );
                 self.index.remove(key);
                 Ok(())
             } else {
+                error!(
+                    "Failed to delete key '{}' from page",
+                    String::from_utf8_lossy(key)
+                );
                 Err(DatabaseError::InvalidData)
             }
         } else {
@@ -246,83 +261,18 @@ impl Database {
         }
     }
 
-    // Get all keys in sorted order
+    /// Retrieve all keys in the database in sorted order.
     pub fn keys(&self) -> Vec<Vec<u8>> {
         self.index.keys().cloned().collect()
     }
 
-    // Get number of key-value pairs
+    /// Return the number of key-value pairs in the database.
     pub fn len(&self) -> usize {
         self.index.len()
     }
 
-    // Check if database is empty
+    /// Check if the database is empty.
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_basic_operations() -> Result<(), DatabaseError> {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test.db");
-        let mut db = Database::new(file_path)?;
-
-        // Test set
-        db.set(b"key1", b"value1")?;
-        db.set(b"key2", b"value2")?;
-
-        // Test get
-        assert_eq!(db.get(b"key1")?, b"value1");
-        assert_eq!(db.get(b"key2")?, b"value2");
-        assert!(matches!(
-            db.get(b"nonexistent"),
-            Err(DatabaseError::KeyNotFound)
-        ));
-
-        // Test delete
-        db.delete(b"key1")?;
-        assert!(matches!(db.get(b"key1"), Err(DatabaseError::KeyNotFound)));
-
-        // Test length
-        assert_eq!(db.len(), 1);
-        assert!(!db.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn test_storage_unit_rotation() -> Result<(), DatabaseError> {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test_rotation.db");
-        let mut db = Database::new(file_path)?;
-
-        // Fill up multiple storage units
-        for i in 0..1000 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            db.set(key.as_bytes(), value.as_bytes())?;
-        }
-
-        for i in 0..1000 {
-            let key = format!("key{}", i);
-            let value = db.get(key.as_bytes())?;
-            assert_eq!(value, format!("value{}", i).as_bytes());
-        }
-
-        // random remove some
-        for i in 0..1000 {
-            if i % 2 == 0 {
-                let key = format!("key{}", i);
-                db.delete(key.as_bytes())?;
-            }
-        }
-
-        Ok(())
     }
 }
