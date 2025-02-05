@@ -18,6 +18,21 @@ pub struct ObjectMetadata {
     pub freq_accessed: u32, // access frequency
 }
 
+impl ObjectMetadata {
+    /// Update hotness based on access frequency
+    /// Returns true if hotness status changed
+    pub fn update_hotness(&mut self) -> bool {
+        self.freq_accessed += 1;
+        let should_be_hot = self.freq_accessed >= 2;
+        if should_be_hot != self.location.is_hot {
+            self.location.is_hot = should_be_hot;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// When `freq_accessed >= 2`, it is considered as hot data.
 /// Here `is_hot` is only used as a hint for PageManager.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -154,7 +169,7 @@ impl PageManager {
         let page_id = self.next_id;
         let mut new_page = Page::new(page_id, self.page_size);
         if let Some(page_index) = new_page.push_entry(key, value) {
-            info!("Creating new page {} for entry", page_id);
+            debug!("Creating new page {} for entry", page_id);
             self.device.write_page(&mut new_page)?;
             self.pages.insert(
                 page_id,
@@ -246,20 +261,20 @@ impl Database {
 
     /// Set key-value pair
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), DatabaseError> {
-        // If key exists, update access frequency first
-        let mut freq = 1;
-        if let Some(metadata) = self.index.get_mut(key) {
-            metadata.freq_accessed += 1;
-            freq = metadata.freq_accessed;
-            debug!(
-                "Key '{}' freq updated to {}",
-                String::from_utf8_lossy(key),
-                freq
-            );
-        }
+        // Default to cold for new entries
+        let mut is_hot = false;
 
-        // freq >= 2 is considered hot
-        let is_hot = freq >= 2;
+        // If key exists, update hotness
+        if let Some(metadata) = self.index.get_mut(key) {
+            if metadata.update_hotness() {
+                debug!(
+                    "Key '{}' hotness changed to {}",
+                    String::from_utf8_lossy(key),
+                    metadata.location.is_hot
+                );
+            }
+            is_hot = metadata.location.is_hot;
+        }
 
         // Call PageManager to write
         match self.page_manager.set(key, value, is_hot)? {
@@ -272,7 +287,7 @@ impl Database {
                 let metadata = ObjectMetadata {
                     location,
                     size: (key.len() + value.len()) as u32,
-                    freq_accessed: freq, // Updated access frequency
+                    freq_accessed: 1, // Updated access frequency
                 };
                 self.index.insert(key.to_vec(), metadata);
                 Ok(())
@@ -290,17 +305,14 @@ impl Database {
     /// Read value for key
     pub fn get(&mut self, key: &[u8]) -> Result<Vec<u8>, DatabaseError> {
         if let Some(metadata) = self.index.get_mut(key) {
-            // Increment access frequency
-            metadata.freq_accessed += 1;
-            let freq = metadata.freq_accessed;
-
-            // If freq >= 2 after update, it can be considered as hot data
-            // Next write or move can switch to hot page if needed
-            debug!(
-                "Retrieving key '{}' (freq = {})",
-                String::from_utf8_lossy(key),
-                freq
-            );
+            // Update hotness and log if changed
+            if metadata.update_hotness() {
+                debug!(
+                    "Key '{}' hotness changed to {}",
+                    String::from_utf8_lossy(key),
+                    metadata.location.is_hot
+                );
+            }
 
             // Read data from corresponding Page
             if let Some(value) = self.page_manager.get(&metadata.location, key)? {
