@@ -10,30 +10,35 @@ use crate::storage::page::Page;
 
 const DEFAULT_PAGE_SIZE: u32 = 4096; // 4KB page size
 
+/// `ObjectMetadata` only keeps `freq_accessed` to determine data hotness.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ObjectMetadata {
-    pub location: Location, // Location of the object in the page
-    pub size: u32,          // Size of the object in bytes
-    pub last_accessed: u64, // Timestamp of the last access
-    pub freq_accessed: u32, // Frequency of access
+    pub location: Location,
+    pub size: u32,
+    pub freq_accessed: u32, // access frequency
 }
 
-/// Represents the location of an entry in a page.
+/// When `freq_accessed >= 2`, it is considered as hot data.
+/// Here `is_hot` is only used as a hint for PageManager.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Location {
     pub page_id: u64,
     pub page_index: usize,
-    pub is_young: bool, // Indicates if this is a frequently accessed page (freq >= 2)
+    pub is_hot: bool, // set to true when freq >= 2
 }
 
-/// Represents the status of a page, either cached in memory or only stored on SSD.
+/// Page status in memory or on SSD, with additional "pool" information.
 #[derive(Debug)]
 enum PageStatus {
-    Memory(Rc<RefCell<Page>>, bool), // bool indicates if it's a young page
-    Ssd,                             // Indicates the page is only on SSD.
+    /// Memory(page, is_hot)
+    /// - `page` represents the actual Page loaded into memory
+    /// - `is_hot` is used to distinguish which pool this page belongs to
+    Memory(Rc<RefCell<Page>>, bool),
+    /// Only on SSD, not in memory
+    Ssd,
 }
 
-/// Errors related to page management operations.
+/// PageManager related errors
 #[derive(Debug)]
 pub enum PageManagerError {
     Storage(SsdError),
@@ -46,7 +51,7 @@ impl From<SsdError> for PageManagerError {
     }
 }
 
-/// Errors that can occur at the database level.
+/// Database level errors
 #[derive(Debug)]
 pub enum DatabaseError {
     KeyNotFound,
@@ -61,9 +66,10 @@ impl From<PageManagerError> for DatabaseError {
     }
 }
 
-/// Manages pages in memory and on SSD.
+/// PageManager is responsible for managing memory pages and SSD pages, distinguishing between "cold" and "hot" data.
 #[derive(Debug)]
 struct PageManager {
+    /// Uses a single HashMap, but includes a bool in entries to indicate hot or cold.
     pages: HashMap<u64, PageStatus>,
     device: SsdDevice,
     next_id: u64,
@@ -71,7 +77,7 @@ struct PageManager {
 }
 
 impl PageManager {
-    /// Create a new PageManager with the given storage path and page size.
+    /// Create a new PageManager
     fn new<P: AsRef<Path>>(path: P, page_size: u32) -> Result<Self, PageManagerError> {
         info!("Initializing SSD device at path {:?}", path.as_ref());
         let device = SsdDevice::new(path, page_size)?;
@@ -83,60 +89,68 @@ impl PageManager {
         })
     }
 
-    /// Ensure that the page with the given ID is loaded into memory.
-    /// If the page is only on SSD, load it and cache it.
+    /// Find the corresponding Page in the specified pool (determined by `is_hot`), load from SSD if it doesn't exist.
     fn ensure_page_loaded(
         &mut self,
         page_id: u64,
-        is_young: bool,
+        is_hot: bool,
     ) -> Result<Rc<RefCell<Page>>, PageManagerError> {
         match self.pages.get(&page_id) {
-            Some(PageStatus::Memory(page, _)) => Ok(Rc::clone(page)),
+            Some(PageStatus::Memory(page, page_is_hot)) => {
+                // If already in memory, return directly
+                if *page_is_hot == is_hot {
+                    return Ok(Rc::clone(page));
+                } else {
+                    // If pool doesn't match, we could do a "transfer" here, or just return directly.
+                    // Simple handling: return existing page, but logic can be extended as needed.
+                    return Ok(Rc::clone(page));
+                }
+            }
             Some(PageStatus::Ssd) | None => {
-                debug!("Loading page {} from SSD (young: {})", page_id, is_young);
+                // If it doesn't exist or is only on SSD, need to read from SSD to memory
+                debug!("Loading page {} from SSD (hot: {})", page_id, is_hot);
                 let page = self.device.read_page(page_id)?;
                 let rc_page = Rc::new(RefCell::new(page));
                 self.pages
-                    .insert(page_id, PageStatus::Memory(Rc::clone(&rc_page), is_young));
+                    .insert(page_id, PageStatus::Memory(Rc::clone(&rc_page), is_hot));
                 Ok(rc_page)
             }
         }
     }
 
-    /// Internal method to add an entry to a page.
-    /// It first attempts to insert into an existing page with enough space.
-    /// If none is found, it creates a new page.
+    /// Find a Page in memory (hot or cold Pool) that can fit (key,value); if none exists, create a new Page.
     fn set_inner(
         &mut self,
         key: &[u8],
         value: &[u8],
-        is_young: bool,
+        is_hot: bool,
     ) -> Result<Option<Location>, PageManagerError> {
-        let required_space = key.len() + value.len() + 8; // 8 bytes reserved for metadata
+        let required_space = key.len() + value.len() + 8; // 8 bytes for entry metadata
 
-        // First try to find a page with matching young/old status
+        // Find a page that matches is_hot and has enough space
         for (&page_id, status) in self.pages.iter() {
-            if let PageStatus::Memory(page_rc, page_is_young) = status {
-                if *page_is_young != is_young {
-                    continue; // Skip pages with different young/old status
+            if let PageStatus::Memory(page_rc, page_is_hot) = status {
+                if *page_is_hot != is_hot {
+                    continue;
                 }
                 let mut page = page_rc.borrow_mut();
                 let available_space = page.capacity() - page.size();
                 if available_space >= required_space {
                     if let Some(page_index) = page.push_entry(key, value) {
                         debug!("Added entry to existing page {}", page_id);
+                        // Write back to SSD
                         self.device.write_page(&mut page)?;
                         return Ok(Some(Location {
                             page_id,
                             page_index,
-                            is_young,
+                            is_hot,
                         }));
                     }
                 }
             }
         }
 
-        // No suitable page found; create a new one.
+        // If no suitable page found, create a new page
         let page_id = self.next_id;
         let mut new_page = Page::new(page_id, self.page_size);
         if let Some(page_index) = new_page.push_entry(key, value) {
@@ -144,17 +158,17 @@ impl PageManager {
             self.device.write_page(&mut new_page)?;
             self.pages.insert(
                 page_id,
-                PageStatus::Memory(Rc::new(RefCell::new(new_page)), is_young),
+                PageStatus::Memory(Rc::new(RefCell::new(new_page)), is_hot),
             );
             self.next_id += 1;
             return Ok(Some(Location {
                 page_id,
                 page_index,
-                is_young,
+                is_hot,
             }));
         }
 
-        // The entry is too large to fit in a new page.
+        // If entry doesn't fit in a new page, it's too large
         warn!(
             "Entry too large to fit in a new page (page id: {})",
             page_id
@@ -162,30 +176,30 @@ impl PageManager {
         Ok(None)
     }
 
-    /// Public method to insert an entry.
-    /// After writing to the page, marks the page as flushed to SSD.
+    /// Public set interface: marks Page as Ssd after writing (simply removes from memory).
+    /// If you want to keep it in memory (e.g., for hot data), you can modify this behavior.
     pub fn set(
         &mut self,
         key: &[u8],
         value: &[u8],
-        is_young: bool,
+        is_hot: bool,
     ) -> Result<Option<Location>, PageManagerError> {
-        let location = self.set_inner(key, value, is_young)?;
-        if let Some(loc) = location {
-            // Mark the page as flushed to SSD to indicate it is not actively cached.
+        let location = self.set_inner(key, value, is_hot)?;
+        if let Some(loc) = &location {
+            // Mark as Ssd, won't stay in memory
             self.pages.insert(loc.page_id, PageStatus::Ssd);
         }
         Ok(location)
     }
 
-    /// Delete an entry from the specified page.
+    /// Delete key from specified Page
     pub fn delete(
         &mut self,
         page_id: u64,
         key: &[u8],
-        is_young: bool,
+        is_hot: bool,
     ) -> Result<bool, PageManagerError> {
-        let page_rc = self.ensure_page_loaded(page_id, is_young)?;
+        let page_rc = self.ensure_page_loaded(page_id, is_hot)?;
         let mut page = page_rc.borrow_mut();
         if page.remove_entry(key) {
             info!("Deleted key from page {}", page_id);
@@ -197,29 +211,28 @@ impl PageManager {
         }
     }
 
-    /// Retrieve an entry from a page.
+    /// Read key from specified Page
     pub fn get(
         &mut self,
         location: &Location,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, PageManagerError> {
-        let page_rc = self.ensure_page_loaded(location.page_id, location.is_young)?;
+        let page_rc = self.ensure_page_loaded(location.page_id, location.is_hot)?;
         let page = page_rc.borrow();
         Ok(page.get(location.page_index, key))
     }
 }
 
-/// A simple key-value database that uses PageManager for storage.
+/// Database structure, maintains a memory index and a PageManager.
 #[derive(Debug)]
 pub struct Database {
-    /// In-memory index mapping keys to their metadata including storage location.
+    /// BTreeMap maintains mapping from key to metadata
     index: BTreeMap<Vec<u8>, ObjectMetadata>,
-    /// Manages pages stored on SSD.
     page_manager: PageManager,
 }
 
 impl Database {
-    /// Create a new database with the given storage path.
+    /// Create new database
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
         info!(
             "Initializing database with storage path {:?}",
@@ -231,22 +244,25 @@ impl Database {
         })
     }
 
-    /// Insert or update a key-value pair in the database.
+    /// Set key-value pair
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), DatabaseError> {
-        // Attemtp to get the current metadata for the key.
+        // If key exists, update access frequency first
+        let mut freq = 1;
         if let Some(metadata) = self.index.get_mut(key) {
-            // If the key already exists, update its metadata.
             metadata.freq_accessed += 1;
-            if metadata.freq_accessed > 2 {
-                info!(
-                    "Key '{}' is hot, moving to faster storage",
-                    String::from_utf8_lossy(key)
-                );
-            }
+            freq = metadata.freq_accessed;
+            debug!(
+                "Key '{}' freq updated to {}",
+                String::from_utf8_lossy(key),
+                freq
+            );
         }
-        // Determine if this is a young page based on frequency
-        let is_young = self.index.get(key).map_or(false, |m| m.freq_accessed >= 2);
-        match self.page_manager.set(key, value, is_young)? {
+
+        // freq >= 2 is considered hot
+        let is_hot = freq >= 2;
+
+        // Call PageManager to write
+        match self.page_manager.set(key, value, is_hot)? {
             Some(location) => {
                 debug!(
                     "Writing key '{}' to location {:?}",
@@ -256,11 +272,7 @@ impl Database {
                 let metadata = ObjectMetadata {
                     location,
                     size: (key.len() + value.len()) as u32,
-                    last_accessed: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    freq_accessed: 1,
+                    freq_accessed: freq, // Updated access frequency
                 };
                 self.index.insert(key.to_vec(), metadata);
                 Ok(())
@@ -275,20 +287,22 @@ impl Database {
         }
     }
 
-    /// Retrieve the value associated with a key.
+    /// Read value for key
     pub fn get(&mut self, key: &[u8]) -> Result<Vec<u8>, DatabaseError> {
         if let Some(metadata) = self.index.get_mut(key) {
-            // Update access statistics
-            metadata.last_accessed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+            // Increment access frequency
             metadata.freq_accessed += 1;
+            let freq = metadata.freq_accessed;
+
+            // If freq >= 2 after update, it can be considered as hot data
+            // Next write or move can switch to hot page if needed
             debug!(
-                "Retrieving key '{}' from location {:?}",
+                "Retrieving key '{}' (freq = {})",
                 String::from_utf8_lossy(key),
-                metadata.location
+                freq
             );
+
+            // Read data from corresponding Page
             if let Some(value) = self.page_manager.get(&metadata.location, key)? {
                 return Ok(value);
             }
@@ -298,14 +312,13 @@ impl Database {
         }
     }
 
-    /// Delete a key-value pair from the database.
+    /// Delete specified key
     pub fn delete(&mut self, key: &[u8]) -> Result<(), DatabaseError> {
         if let Some(metadata) = self.index.get(key) {
-            if self.page_manager.delete(
-                metadata.location.page_id,
-                key,
-                metadata.location.is_young,
-            )? {
+            if self
+                .page_manager
+                .delete(metadata.location.page_id, key, metadata.location.is_hot)?
+            {
                 debug!(
                     "Deleted key '{}' from database",
                     String::from_utf8_lossy(key)
@@ -324,17 +337,17 @@ impl Database {
         }
     }
 
-    /// Retrieve all keys in the database in sorted order.
+    /// Return all keys (sorted)
     pub fn keys(&self) -> Vec<Vec<u8>> {
         self.index.keys().cloned().collect()
     }
 
-    /// Return the number of key-value pairs in the database.
+    /// Number of keys in database
     pub fn len(&self) -> usize {
         self.index.len()
     }
 
-    /// Check if the database is empty.
+    /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
     }

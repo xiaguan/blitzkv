@@ -10,7 +10,7 @@ const TOTAL_OPS: usize = 100_000;
 const READ_RATIO: f64 = 0.8; // 80% 读操作
 const UPDATE_RATIO: f64 = 0.15; // 15% 更新操作
 const WRITE_RATIO: f64 = 0.05; // 5% 写入操作
-const ZIPF_S: f64 = 1.01; // Zipf 分布参数
+const ZIPF_S: f64 = 1.2; // Zipf 分布参数
 const VALUE_SIZE: std::ops::Range<usize> = 600..1100;
 
 fn generate_kv_pairs<R: Rng>(rng: &mut R, num_keys: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
