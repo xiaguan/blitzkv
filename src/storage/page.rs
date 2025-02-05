@@ -217,6 +217,10 @@ impl Page {
         }
     }
 
+    pub fn free_space(&self) -> u32 {
+        self.header.size - self.current_size as u32
+    }
+
     // Attempt to add an entry to the storage unit
     // Returns the offset of the entry if successful, or None if the entry exceeds the size limit
     pub fn push_entry(&mut self, key: &[u8], value: &[u8]) -> Option<usize> {
