@@ -32,6 +32,11 @@ fn generate_value<R: Rng>(rng: &mut R) -> Vec<u8> {
 
 #[instrument(skip(db))]
 fn run_benchmark(db: &mut Database) -> Result<(), DatabaseError> {
+    info!("Starting benchmark...");
+    info!(
+        "Read ratio: {:.2}, Update ratio: {:.2}, Write ratio: {:.2}",
+        READ_RATIO, UPDATE_RATIO, WRITE_RATIO
+    );
     let mut rng = rand::thread_rng();
 
     // 1. 生成测试数据

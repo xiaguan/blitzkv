@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -48,7 +48,7 @@ enum PageStatus {
     /// Memory(page, is_hot)
     /// - `page` represents the actual Page loaded into memory
     /// - `is_hot` is used to distinguish which pool this page belongs to
-    Memory(Rc<RefCell<Page>>),
+    Memory(Rc<RefCell<Page>>, bool),
     /// Only on SSD, not in memory
     Ssd,
 }
@@ -81,68 +81,11 @@ impl From<PageManagerError> for DatabaseError {
     }
 }
 
-/// PagePool manages a set of pages with similar hotness characteristics
-#[derive(Debug)]
-struct PagePool {
-    pages: HashMap<u64, PageStatus>,
-    space_index: BTreeMap<u32, BTreeSet<u64>>, // available_space -> page_ids
-    page_space_index: HashMap<u64, u32>,       // page_id -> available_space
-    pre_allocated: Vec<u64>,                   // Pre-allocated empty page IDs
-}
-
-impl PagePool {
-    fn new() -> Self {
-        PagePool {
-            pages: HashMap::new(),
-            space_index: BTreeMap::new(),
-            page_space_index: HashMap::new(),
-            pre_allocated: Vec::new(),
-        }
-    }
-
-    fn update_space_index(&mut self, page_id: u64, available_space: u32) {
-        // If page exists in index, remove it from old space bucket
-        if let Some(old_space) = self.page_space_index.get(&page_id) {
-            if let Some(pages) = self.space_index.get_mut(old_space) {
-                pages.remove(&page_id);
-                // Remove bucket if empty
-                if pages.is_empty() {
-                    self.space_index.remove(old_space);
-                }
-            }
-        }
-
-        // Add to new space bucket
-        self.space_index
-            .entry(available_space)
-            .or_insert_with(BTreeSet::new)
-            .insert(page_id);
-        self.page_space_index.insert(page_id, available_space);
-    }
-
-    fn find_page_with_space(&self, required_space: u32) -> Option<u64> {
-        // Find first page with enough space
-        for (_, pages) in self.space_index.range(required_space..) {
-            if let Some(&page_id) = pages.first() {
-                return Some(page_id);
-            }
-        }
-        None
-    }
-}
-
-// when page pool drop,print the page pool info
-impl Drop for PagePool {
-    fn drop(&mut self) {
-        info!("PagePool has {} pages", self.pages.len());
-    }
-}
-
 /// PageManager is responsible for managing memory pages and SSD pages, distinguishing between "cold" and "hot" data.
 #[derive(Debug)]
 struct PageManager {
-    hot_pool: PagePool,
-    cold_pool: PagePool,
+    /// Uses a single HashMap, but includes a bool in entries to indicate hot or cold.
+    pages: HashMap<u64, PageStatus>,
     device: SsdDevice,
     next_id: u64,
     page_size: u32,
@@ -153,98 +96,41 @@ impl PageManager {
     fn new<P: AsRef<Path>>(path: P, page_size: u32) -> Result<Self, PageManagerError> {
         info!("Initializing SSD device at path {:?}", path.as_ref());
         let device = SsdDevice::new(path, page_size)?;
-        let mut pm = PageManager {
-            hot_pool: PagePool::new(),
-            cold_pool: PagePool::new(),
+        Ok(PageManager {
+            pages: HashMap::new(),
             device,
             next_id: 0,
             page_size,
-        };
-
-        // Pre-allocate some pages for each pool
-        pm.pre_allocate_pages(false, 10)?; // Cold pool
-        pm.pre_allocate_pages(true, 10)?; // Hot pool
-
-        Ok(pm)
+        })
     }
 
-    /// Pre-allocate empty pages for the specified pool
-    fn pre_allocate_pages(&mut self, is_hot: bool, count: usize) -> Result<(), PageManagerError> {
-        let pool = if is_hot {
-            &mut self.hot_pool
-        } else {
-            &mut self.cold_pool
-        };
-
-        for _ in 0..count {
-            let page_id = self.next_id;
-
-            pool.pre_allocated.push(page_id);
-            pool.update_space_index(page_id, self.page_size);
-
-            self.next_id += 1;
-        }
-
-        Ok(())
-    }
-
-    /// Find the corresponding Page in the specified pool, load from SSD if it doesn't exist.
+    /// Find the corresponding Page in the specified pool (determined by `is_hot`), load from SSD if it doesn't exist.
     fn ensure_page_loaded(
         &mut self,
         page_id: u64,
         is_hot: bool,
     ) -> Result<Rc<RefCell<Page>>, PageManagerError> {
-        let pool = if is_hot {
-            &mut self.hot_pool
-        } else {
-            &mut self.cold_pool
-        };
-
-        match pool.pages.get(&page_id) {
-            Some(PageStatus::Memory(page)) => Ok(Rc::clone(page)),
+        match self.pages.get(&page_id) {
+            Some(PageStatus::Memory(page, page_is_hot)) => {
+                // If already in memory, return directly
+                if *page_is_hot == is_hot {
+                    return Ok(Rc::clone(page));
+                } else {
+                    // If pool doesn't match, we could do a "transfer" here, or just return directly.
+                    // Simple handling: return existing page, but logic can be extended as needed.
+                    return Ok(Rc::clone(page));
+                }
+            }
             Some(PageStatus::Ssd) | None => {
                 // If it doesn't exist or is only on SSD, need to read from SSD to memory
                 debug!("Loading page {} from SSD (hot: {})", page_id, is_hot);
                 let page = self.device.read_page(page_id)?;
                 let rc_page = Rc::new(RefCell::new(page));
-
-                // Update space index
-                let available_space = self.page_size - rc_page.borrow().size() as u32;
-                pool.update_space_index(page_id, available_space);
-
-                pool.pages
-                    .insert(page_id, PageStatus::Memory(Rc::clone(&rc_page)));
+                self.pages
+                    .insert(page_id, PageStatus::Memory(Rc::clone(&rc_page), is_hot));
                 Ok(rc_page)
             }
         }
-    }
-
-    /// Move a page between hot and cold pools
-    fn migrate_page(&mut self, page_id: u64, to_hot: bool) -> Result<(), PageManagerError> {
-        let (source_pool, target_pool) = if to_hot {
-            (&mut self.cold_pool, &mut self.hot_pool)
-        } else {
-            (&mut self.hot_pool, &mut self.cold_pool)
-        };
-
-        // Remove from source pool
-        if let Some(status) = source_pool.pages.remove(&page_id) {
-            match status {
-                PageStatus::Memory(page) => {
-                    // Update target pool's space index
-                    let available_space = self.page_size - page.borrow().size() as u32;
-                    target_pool.update_space_index(page_id, available_space);
-
-                    // Insert into target pool
-                    target_pool.pages.insert(page_id, PageStatus::Memory(page));
-                }
-                PageStatus::Ssd => {
-                    // Just move the SSD status to target pool
-                    target_pool.pages.insert(page_id, PageStatus::Ssd);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Find a Page in memory (hot or cold Pool) that can fit (key,value); if none exists, create a new Page.
@@ -254,84 +140,41 @@ impl PageManager {
         value: &[u8],
         is_hot: bool,
     ) -> Result<Option<Location>, PageManagerError> {
-        let required_space = (key.len() + value.len() + 8) as u32; // 8 bytes for entry metadata
-        let pool = if is_hot {
-            &mut self.hot_pool
-        } else {
-            &mut self.cold_pool
-        };
+        let required_space = key.len() + value.len() + 8; // 8 bytes for entry metadata
 
-        // For hot data, try to find a page that already has hot data and has enough space
-        let page_id = pool.find_page_with_space(required_space);
-
-        // Try to use an existing page with enough space
-        if let Some(page_id) = page_id {
-            let page_rc = {
-                if let Some(PageStatus::Memory(page_rc)) = pool.pages.get(&page_id) {
-                    Some(page_rc.clone())
-                } else {
-                    None
+        // Find a page that matches is_hot and has enough space
+        for (&page_id, status) in self.pages.iter() {
+            if let PageStatus::Memory(page_rc, page_is_hot) = status {
+                if *page_is_hot != is_hot {
+                    continue;
                 }
-            };
-            if let Some(page_rc) = page_rc {
                 let mut page = page_rc.borrow_mut();
-                if let Some(page_index) = page.push_entry(key, value) {
-                    debug!("Added entry to existing page {}", page_id);
-                    // Update space index
-                    let new_space = page.capacity() as u32 - page.size() as u32;
-                    pool.update_space_index(page_id, new_space);
-                    // Write back to SSD
-                    self.device.write_page(&mut page)?;
-                    return Ok(Some(Location {
-                        page_id,
-                        page_index,
-                        is_hot,
-                    }));
+                let available_space = page.capacity() - page.size();
+                if available_space >= required_space {
+                    if let Some(page_index) = page.push_entry(key, value) {
+                        debug!("Added entry to existing page {}", page_id);
+                        // Write back to SSD
+                        self.device.write_page(&mut page)?;
+                        return Ok(Some(Location {
+                            page_id,
+                            page_index,
+                            is_hot,
+                        }));
+                    }
                 }
             }
         }
 
-        // Try to use a pre-allocated page
-        if let Some(page_id) = pool.pre_allocated.pop() {
-            let mut new_page = Page::new(page_id, self.page_size);
-            if let Some(page_index) = new_page.push_entry(key, value) {
-                debug!("Using pre-allocated page {} for entry", page_id);
-                self.device.write_page(&mut new_page)?;
-                let rc_page = Rc::new(RefCell::new(new_page));
-                pool.pages
-                    .insert(page_id, PageStatus::Memory(Rc::clone(&rc_page)));
-
-                // Update space index
-                let available_space = self.page_size - rc_page.borrow().size() as u32;
-                pool.update_space_index(page_id, available_space);
-
-                // If pre-allocated pages are running low, allocate more
-                if pool.pre_allocated.len() < 5 {
-                    self.pre_allocate_pages(is_hot, 5)?;
-                }
-
-                return Ok(Some(Location {
-                    page_id,
-                    page_index,
-                    is_hot,
-                }));
-            }
-        }
-
-        // If no pre-allocated pages or entry doesn't fit, create a new page
+        // If no suitable page found, create a new page
         let page_id = self.next_id;
         let mut new_page = Page::new(page_id, self.page_size);
         if let Some(page_index) = new_page.push_entry(key, value) {
             debug!("Creating new page {} for entry", page_id);
             self.device.write_page(&mut new_page)?;
-            let rc_page = Rc::new(RefCell::new(new_page));
-            pool.pages
-                .insert(page_id, PageStatus::Memory(Rc::clone(&rc_page)));
-
-            // Update space index
-            let available_space = self.page_size - rc_page.borrow().size() as u32;
-            pool.update_space_index(page_id, available_space);
-
+            self.pages.insert(
+                page_id,
+                PageStatus::Memory(Rc::new(RefCell::new(new_page)), is_hot),
+            );
             self.next_id += 1;
             return Ok(Some(Location {
                 page_id,
@@ -348,8 +191,8 @@ impl PageManager {
         Ok(None)
     }
 
-    /// Public set interface: marks Page as Ssd after writing for cold data,
-    /// but keeps hot data in memory for better performance.
+    /// Public set interface: marks Page as Ssd after writing (simply removes from memory).
+    /// If you want to keep it in memory (e.g., for hot data), you can modify this behavior.
     pub fn set(
         &mut self,
         key: &[u8],
@@ -358,12 +201,8 @@ impl PageManager {
     ) -> Result<Option<Location>, PageManagerError> {
         let location = self.set_inner(key, value, is_hot)?;
         if let Some(loc) = &location {
-            let pool = if is_hot {
-                &mut self.hot_pool
-            } else {
-                &mut self.cold_pool
-            };
-            pool.pages.insert(loc.page_id, PageStatus::Ssd);
+            // Mark as Ssd, won't stay in memory
+            self.pages.insert(loc.page_id, PageStatus::Ssd);
         }
         Ok(location)
     }
@@ -422,28 +261,35 @@ impl Database {
 
     /// Set key-value pair
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), DatabaseError> {
+        // Default to cold for new entries
         let mut is_hot = false;
 
-        // If key exists, update frequency and hotness
+        // If key exists, update hotness
         if let Some(metadata) = self.index.get_mut(key) {
-            is_hot = metadata.update_hotness();
+            if metadata.update_hotness() {
+                debug!(
+                    "Key '{}' hotness changed to {}",
+                    String::from_utf8_lossy(key),
+                    metadata.location.is_hot
+                );
+            }
+            is_hot = metadata.location.is_hot;
         }
 
-        // Call PageManager to write with updated hotness
+        // Call PageManager to write
         match self.page_manager.set(key, value, is_hot)? {
             Some(location) => {
-                if let Some(metadata) = self.index.get_mut(key) {
-                    metadata.location = location;
-                } else {
-                    self.index.insert(
-                        key.to_vec(),
-                        ObjectMetadata {
-                            location,
-                            size: value.len() as u32,
-                            freq_accessed: 1,
-                        },
-                    );
-                }
+                debug!(
+                    "Writing key '{}' to location {:?}",
+                    String::from_utf8_lossy(key),
+                    location
+                );
+                let metadata = ObjectMetadata {
+                    location,
+                    size: (key.len() + value.len()) as u32,
+                    freq_accessed: 1, // Updated access frequency
+                };
+                self.index.insert(key.to_vec(), metadata);
                 Ok(())
             }
             None => {
@@ -466,17 +312,13 @@ impl Database {
                     String::from_utf8_lossy(key),
                     metadata.location.is_hot
                 );
-                // Migrate page between pools if hotness changed
-                self.page_manager
-                    .migrate_page(metadata.location.page_id, metadata.location.is_hot)?;
             }
 
             // Read data from corresponding Page
             if let Some(value) = self.page_manager.get(&metadata.location, key)? {
-                Ok(value)
-            } else {
-                Err(DatabaseError::InvalidData)
+                return Ok(value);
             }
+            Err(DatabaseError::InvalidData)
         } else {
             Err(DatabaseError::KeyNotFound)
         }
