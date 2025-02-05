@@ -1,3 +1,4 @@
+use hashlink::LruCache;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -9,6 +10,7 @@ use crate::storage::device::{SsdDevice, SsdError, SsdMetrics};
 use crate::storage::page::Page;
 
 const DEFAULT_PAGE_SIZE: u32 = 4096; // 4KB page size
+const DEFAULT_CACHE_SIZE: usize = 100; // 100 pages in cache
 
 /// `ObjectMetadata` only keeps `freq_accessed` to determine data hotness.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -76,6 +78,9 @@ struct PageManager {
     device: SsdDevice,
     next_id: u64,
     page_size: u32,
+    page_cache: LruCache<u64, Rc<RefCell<Page>>>,
+    hit_count: usize,
+    miss_count: usize,
 
     hot_free_spaces: BTreeMap<usize, Vec<u64>>,
     cold_free_spaces: BTreeMap<usize, Vec<u64>>,
@@ -90,6 +95,9 @@ impl PageManager {
             device,
             next_id: 0,
             page_size,
+            page_cache: LruCache::new(DEFAULT_CACHE_SIZE),
+            hit_count: 0,
+            miss_count: 0,
             hot_free_spaces: BTreeMap::new(),
             cold_free_spaces: BTreeMap::new(),
         })
@@ -142,12 +150,22 @@ impl PageManager {
     }
 
     fn ensure_page_loaded(&mut self, page_id: u64) -> Result<Rc<RefCell<Page>>, PageManagerError> {
+        // First check the LRU cache
+        if let Some(page) = self.page_cache.get(&page_id) {
+            self.hit_count += 1;
+            return Ok(Rc::clone(page));
+        }
+        self.miss_count += 1;
+        // Then check in-memory pages
         if let Some(status) = self.pages.get(&page_id) {
             if let Some(page) = &status.in_memory {
-                return Ok(Rc::clone(page));
+                let page_rc = Rc::clone(page);
+                self.page_cache.insert(page_id, Rc::clone(&page_rc));
+                return Ok(page_rc);
             }
         }
 
+        // Finally read from disk
         let page = self.device.read_page(page_id)?;
         let free_space = page.free_space() as usize;
         let rc_page = Rc::new(RefCell::new(page));
@@ -162,6 +180,9 @@ impl PageManager {
         let is_hot = entry.is_hot;
 
         self.update_free_space_index(page_id, 0, free_space, is_hot);
+
+        // Add to cache
+        self.page_cache.insert(page_id, Rc::clone(&rc_page));
 
         Ok(rc_page)
     }
@@ -211,13 +232,16 @@ impl PageManager {
             self.pages.insert(
                 page_id,
                 PageStatus {
-                    in_memory: Some(rc_page),
+                    in_memory: Some(Rc::clone(&rc_page)),
                     is_hot,
                     free_space,
                 },
             );
 
             self.update_free_space_index(page_id, 0, free_space, is_hot);
+
+            // Add new page to cache
+            self.page_cache.insert(page_id, rc_page);
 
             self.next_id += 1;
             Ok(Some(Location {
@@ -252,6 +276,8 @@ impl PageManager {
             if let Some(old_free) = old_free {
                 self.update_free_space_index(loc.page_id, old_free, 0, is_hot.unwrap());
             }
+            // Remove from cache when page is written
+            self.page_cache.remove(&loc.page_id);
         }
         Ok(location)
     }
@@ -360,5 +386,14 @@ impl Database {
     /// Get the SSD device metrics
     pub fn metrics(&self) -> &SsdMetrics {
         self.page_manager.device.metrics()
+    }
+
+    pub fn hit_ratio(&self) -> f64 {
+        info!(
+            "Hit count {}, miss count {}",
+            self.page_manager.hit_count, self.page_manager.miss_count
+        );
+        (self.page_manager.hit_count as f64)
+            / (self.page_manager.hit_count as f64 + self.page_manager.miss_count as f64)
     }
 }

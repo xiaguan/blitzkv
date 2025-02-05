@@ -1,0 +1,82 @@
+[
+  {
+    "variant": "optimized",
+    "read_ratio": 0.8,
+    "zipf": 1.1,
+    "throughput": 43320.034368694374,
+    "duration_secs": 2.308400754,
+    "hit_ratio": 0.531598202153235,
+    "read_ssd_ops": 22096,
+    "write_ssd_ops": 30063
+  },
+  {
+    "variant": "optimized",
+    "read_ratio": 0.8,
+    "zipf": 1.3,
+    "throughput": 49350.537403121205,
+    "duration_secs": 2.026320386,
+    "hit_ratio": 0.6882104274307187,
+    "read_ssd_ops": 19450,
+    "write_ssd_ops": 29861
+  },
+  {
+    "variant": "optimized",
+    "read_ratio": 0.7,
+    "zipf": 1.1,
+    "throughput": 33934.22481831288,
+    "duration_secs": 2.946877394,
+    "hit_ratio": 0.579439664195137,
+    "read_ssd_ops": 24259,
+    "write_ssd_ops": 39874
+  },
+  {
+    "variant": "optimized",
+    "read_ratio": 0.7,
+    "zipf": 1.3,
+    "throughput": 41164.02490197599,
+    "duration_secs": 2.429305692,
+    "hit_ratio": 0.7003510560646963,
+    "read_ssd_ops": 19704,
+    "write_ssd_ops": 40046
+  },
+  {
+    "variant": "baseline",
+    "read_ratio": 0.8,
+    "zipf": 1.1,
+    "throughput": 42934.46342806104,
+    "duration_secs": 2.329131239,
+    "hit_ratio": 0.536180116367316,
+    "read_ssd_ops": 23327,
+    "write_ssd_ops": 29943
+  },
+  {
+    "variant": "baseline",
+    "read_ratio": 0.8,
+    "zipf": 1.3,
+    "throughput": 50069.65510166986,
+    "duration_secs": 1.997217672,
+    "hit_ratio": 0.6876916383525317,
+    "read_ssd_ops": 20513,
+    "write_ssd_ops": 29891
+  },
+  {
+    "variant": "baseline",
+    "read_ratio": 0.7,
+    "zipf": 1.1,
+    "throughput": 32886.89397779305,
+    "duration_secs": 3.040724979,
+    "hit_ratio": 0.5551824248201751,
+    "read_ssd_ops": 26970,
+    "write_ssd_ops": 39874
+  },
+  {
+    "variant": "baseline",
+    "read_ratio": 0.7,
+    "zipf": 1.3,
+    "throughput": 38345.95636009831,
+    "duration_secs": 2.6078369009999998,
+    "hit_ratio": 0.6570369380802885,
+    "read_ssd_ops": 24000,
+    "write_ssd_ops": 39762
+  }
+]

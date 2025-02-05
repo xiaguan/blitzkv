@@ -1,17 +1,28 @@
 use blitzkv::database::{Database, DatabaseError};
 use rand::prelude::*;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Instant;
-use tracing::{error, info, instrument};
+use tracing::{info, instrument};
 use tracing_subscriber;
 
 const NUM_KEYS: usize = 10_000;
 const TOTAL_OPS: usize = 100_000;
-const READ_RATIO: f64 = 0.8; // 80% 读操作
-const UPDATE_RATIO: f64 = 0.15; // 15% 更新操作
-const WRITE_RATIO: f64 = 0.05; // 5% 写入操作
-const ZIPF_S: f64 = 1.2; // Zipf 分布参数
+const UPDATE_RATIO: f64 = 0.15; // 固定15%
+const WRITE_RATIO: f64 = 0.05; // 固定5%
 const VALUE_SIZE: std::ops::Range<usize> = 600..1100;
+
+#[derive(Serialize)]
+struct BenchmarkResult {
+    variant: String,    // "baseline" 或 "optimized"
+    read_ratio: f64,    // 例如 0.6 或 0.8
+    zipf: f64,          // 例如 1.1, 1.2, 1.3
+    throughput: f64,    // ops/sec
+    duration_secs: f64, // 运行时长，单位秒
+    hit_ratio: f64,
+    read_ssd_ops: u64,
+    write_ssd_ops: u64,
+}
 
 fn generate_kv_pairs<R: Rng>(rng: &mut R, num_keys: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut keys = Vec::with_capacity(num_keys);
@@ -30,12 +41,17 @@ fn generate_value<R: Rng>(rng: &mut R) -> Vec<u8> {
     (0..value_len).map(|_| rng.gen()).collect()
 }
 
+/// 带参数的基准测试函数，返回一个 BenchmarkResult
 #[instrument(skip(db))]
-fn run_benchmark(db: &mut Database) -> Result<(), DatabaseError> {
-    info!("Starting benchmark...");
+fn run_benchmark_with_params(
+    db: &mut Database,
+    read_ratio: f64,
+    zipf_param: f64,
+    variant: &str,
+) -> Result<BenchmarkResult, DatabaseError> {
     info!(
-        "Read ratio: {:.2}, Update ratio: {:.2}, Write ratio: {:.2}",
-        READ_RATIO, UPDATE_RATIO, WRITE_RATIO
+        "Starting benchmark with read_ratio={:.2}, zipf={:.2}, variant={}",
+        read_ratio, zipf_param, variant
     );
     let mut rng = rand::thread_rng();
 
@@ -49,8 +65,8 @@ fn run_benchmark(db: &mut Database) -> Result<(), DatabaseError> {
         db.set(key, value)?;
     }
 
-    // 3. 初始化分布和统计
-    let zipf = zipf::ZipfDistribution::new(NUM_KEYS, ZIPF_S).unwrap();
+    // 3. 初始化 Zipf 分布和统计数据
+    let zipf = zipf::ZipfDistribution::new(NUM_KEYS, zipf_param).unwrap();
     let mut current_key_id = NUM_KEYS;
     let mut op_counts = [0; 3]; // [read, update, write]
 
@@ -61,85 +77,98 @@ fn run_benchmark(db: &mut Database) -> Result<(), DatabaseError> {
     for _ in 0..TOTAL_OPS {
         let op = rng.gen::<f64>();
 
-        match op {
-            p if p < READ_RATIO => {
-                let idx = zipf.sample(&mut rng) - 1;
-                let stored = db.get(&keys[idx])?;
-                assert_eq!(
-                    stored,
-                    values[idx],
-                    "Data mismatch for key {}",
-                    String::from_utf8_lossy(&keys[idx])
-                );
-                op_counts[0] += 1;
-            }
-            p if p < READ_RATIO + UPDATE_RATIO => {
-                let idx = zipf.sample(&mut rng) - 1;
-                let new_value = generate_value(&mut rng);
-                db.set(&keys[idx], &new_value)?;
-                values[idx] = new_value;
-                op_counts[1] += 1;
-            }
-            _ => {
-                let new_key = format!("key_{:08}", current_key_id).into_bytes();
-                let new_value = generate_value(&mut rng);
-                db.set(&new_key, &new_value)?;
-                current_key_id += 1;
-                op_counts[2] += 1;
-            }
+        if op < read_ratio {
+            let idx = zipf.sample(&mut rng) - 1;
+            let stored = db.get(&keys[idx])?;
+            assert_eq!(
+                stored,
+                values[idx],
+                "Data mismatch for key {}",
+                String::from_utf8_lossy(&keys[idx])
+            );
+            op_counts[0] += 1;
+        } else if op < read_ratio + UPDATE_RATIO {
+            let idx = zipf.sample(&mut rng) - 1;
+            let new_value = generate_value(&mut rng);
+            db.set(&keys[idx], &new_value)?;
+            values[idx] = new_value;
+            op_counts[1] += 1;
+        } else {
+            let new_key = format!("key_{:08}", current_key_id).into_bytes();
+            let new_value = generate_value(&mut rng);
+            db.set(&new_key, &new_value)?;
+            current_key_id += 1;
+            op_counts[2] += 1;
         }
     }
 
     let duration = start_time.elapsed();
+    let throughput = TOTAL_OPS as f64 / duration.as_secs_f64();
 
     info!("Benchmark completed in {:.2?}", duration);
+    info!("Throughput: {:.2} ops/sec", throughput);
     info!(
-        "Throughput: {:.2} ops/sec",
-        TOTAL_OPS as f64 / duration.as_secs_f64()
+        "Operation distribution: reads={}, updates={}, writes={}",
+        op_counts[0], op_counts[1], op_counts[2]
     );
-    info!("Operation distribution:");
-    info!(
-        "  Reads: {} ({:.1}%)",
-        op_counts[0],
-        op_counts[0] as f64 / TOTAL_OPS as f64 * 100.0
-    );
-    info!(
-        "  Updates: {} ({:.1}%)",
-        op_counts[1],
-        op_counts[1] as f64 / TOTAL_OPS as f64 * 100.0
-    );
-    info!(
-        "  Writes: {} ({:.1}%)",
-        op_counts[2],
-        op_counts[2] as f64 / TOTAL_OPS as f64 * 100.0
-    );
-    info!("Zipf parameter: s={}", ZIPF_S);
     info!("Total unique keys: {}", current_key_id);
 
-    // Print SSD metrics after benchmark
-    info!("SSD Metrics:\n{}", db.metrics());
-
-    Ok(())
+    let hit_ratio = db.hit_ratio();
+    let ssd_metrics = db.metrics();
+    // 返回结构化结果
+    Ok(BenchmarkResult {
+        variant: variant.to_string(),
+        read_ratio,
+        zipf: zipf_param,
+        throughput,
+        duration_secs: duration.as_secs_f64(),
+        hit_ratio,
+        read_ssd_ops: ssd_metrics.reads(),
+        write_ssd_ops: ssd_metrics.writes(),
+    })
 }
 
-fn main() {
+fn main() -> Result<(), DatabaseError> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
 
     let data_dir = PathBuf::from("data");
-    if let Err(e) = std::fs::create_dir_all(&data_dir) {
-        error!("Failed to create data directory: {}", e);
-        std::process::exit(1);
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let read_ratios = vec![0.8, 0.7];
+    let zipf_params = vec![1.1, 1.3];
+    let variants = vec![("optimized", 2), ("baseline", 200)];
+
+    let mut all_results = Vec::new();
+
+    // 遍历每个配置
+    for &(variant_name, hot_threshold) in &variants {
+        for &read_ratio in &read_ratios {
+            for &zipf_param in &zipf_params {
+                // 为每个实验构造不同的数据库文件路径，避免冲突
+                let db_path = data_dir.join(format!(
+                    "bench_{}_r{:.0}_z{}.db",
+                    variant_name,
+                    read_ratio * 100.0,
+                    zipf_param
+                ));
+                info!(
+                    "Running {} with read_ratio={} zipf={} (db: {:?})",
+                    variant_name, read_ratio, zipf_param, db_path
+                );
+                let mut db = Database::new(db_path, hot_threshold)?;
+                let result =
+                    run_benchmark_with_params(&mut db, read_ratio, zipf_param, variant_name)?;
+                all_results.push(result);
+            }
+        }
     }
 
-    // Test with hot_threshold = 2
-    info!("Running benchmark with hot_threshold = 2");
-    let mut db = Database::new(data_dir.join("bench_hot2.db"), 2).unwrap();
-    run_benchmark(&mut db).unwrap();
+    // 输出为 JSON 文件（也可以改成 CSV）
+    let json = serde_json::to_string_pretty(&all_results).unwrap();
+    std::fs::write("results.json", json).unwrap();
+    info!("All benchmark results written to results.json");
 
-    // Test with hot_threshold = 200
-    info!("Running benchmark with hot_threshold = 200");
-    let mut db = Database::new(data_dir.join("bench_hot200.db"), 200).unwrap();
-    run_benchmark(&mut db).unwrap();
+    Ok(())
 }
