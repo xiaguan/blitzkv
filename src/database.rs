@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -85,8 +85,9 @@ impl From<PageManagerError> for DatabaseError {
 #[derive(Debug)]
 struct PagePool {
     pages: HashMap<u64, PageStatus>,
-    space_index: BTreeMap<u32, Vec<u64>>, // available_space -> page_ids
-    pre_allocated: Vec<u64>,              // Pre-allocated empty page IDs
+    space_index: BTreeMap<u32, BTreeSet<u64>>, // available_space -> page_ids
+    page_space_index: HashMap<u64, u32>,       // page_id -> available_space
+    pre_allocated: Vec<u64>,                   // Pre-allocated empty page IDs
 }
 
 impl PagePool {
@@ -94,23 +95,29 @@ impl PagePool {
         PagePool {
             pages: HashMap::new(),
             space_index: BTreeMap::new(),
+            page_space_index: HashMap::new(),
             pre_allocated: Vec::new(),
         }
     }
 
     fn update_space_index(&mut self, page_id: u64, available_space: u32) {
-        // Remove old entry if exists
-        for pages in self.space_index.values_mut() {
-            pages.retain(|&id| id != page_id);
+        // If page exists in index, remove it from old space bucket
+        if let Some(old_space) = self.page_space_index.get(&page_id) {
+            if let Some(pages) = self.space_index.get_mut(old_space) {
+                pages.remove(&page_id);
+                // Remove bucket if empty
+                if pages.is_empty() {
+                    self.space_index.remove(old_space);
+                }
+            }
         }
-        // Clean up empty vectors
-        self.space_index.retain(|_, pages| !pages.is_empty());
 
-        // Add new entry
+        // Add to new space bucket
         self.space_index
             .entry(available_space)
-            .or_default()
-            .push(page_id);
+            .or_insert_with(BTreeSet::new)
+            .insert(page_id);
+        self.page_space_index.insert(page_id, available_space);
     }
 
     fn find_page_with_space(&self, required_space: u32) -> Option<u64> {
@@ -121,6 +128,13 @@ impl PagePool {
             }
         }
         None
+    }
+}
+
+// when page pool drop,print the page pool info
+impl Drop for PagePool {
+    fn drop(&mut self) {
+        info!("PagePool has {} pages", self.pages.len());
     }
 }
 
@@ -164,8 +178,6 @@ impl PageManager {
 
         for _ in 0..count {
             let page_id = self.next_id;
-            let mut new_page = Page::new(page_id, self.page_size);
-            self.device.write_page(&mut new_page)?;
 
             pool.pre_allocated.push(page_id);
             pool.update_space_index(page_id, self.page_size);
@@ -249,8 +261,10 @@ impl PageManager {
             &mut self.cold_pool
         };
 
-        let page_id = { pool.find_page_with_space(required_space) };
+        // For hot data, try to find a page that already has hot data and has enough space
+        let page_id = pool.find_page_with_space(required_space);
 
+        // Try to use an existing page with enough space
         if let Some(page_id) = page_id {
             let page_rc = {
                 if let Some(PageStatus::Memory(page_rc)) = pool.pages.get(&page_id) {
@@ -349,7 +363,6 @@ impl PageManager {
             } else {
                 &mut self.cold_pool
             };
-
             pool.pages.insert(loc.page_id, PageStatus::Ssd);
         }
         Ok(location)
@@ -409,35 +422,28 @@ impl Database {
 
     /// Set key-value pair
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), DatabaseError> {
-        // Default to cold for new entries
         let mut is_hot = false;
 
-        // If key exists, update hotness
+        // If key exists, update frequency and hotness
         if let Some(metadata) = self.index.get_mut(key) {
-            if metadata.update_hotness() {
-                debug!(
-                    "Key '{}' hotness changed to {}",
-                    String::from_utf8_lossy(key),
-                    metadata.location.is_hot
-                );
-            }
-            is_hot = metadata.location.is_hot;
+            is_hot = metadata.update_hotness();
         }
 
-        // Call PageManager to write
+        // Call PageManager to write with updated hotness
         match self.page_manager.set(key, value, is_hot)? {
             Some(location) => {
-                debug!(
-                    "Writing key '{}' to location {:?}",
-                    String::from_utf8_lossy(key),
-                    location
-                );
-                let metadata = ObjectMetadata {
-                    location,
-                    size: (key.len() + value.len()) as u32,
-                    freq_accessed: 1, // Updated access frequency
-                };
-                self.index.insert(key.to_vec(), metadata);
+                if let Some(metadata) = self.index.get_mut(key) {
+                    metadata.location = location;
+                } else {
+                    self.index.insert(
+                        key.to_vec(),
+                        ObjectMetadata {
+                            location,
+                            size: value.len() as u32,
+                            freq_accessed: 1,
+                        },
+                    );
+                }
                 Ok(())
             }
             None => {
@@ -467,9 +473,10 @@ impl Database {
 
             // Read data from corresponding Page
             if let Some(value) = self.page_manager.get(&metadata.location, key)? {
-                return Ok(value);
+                Ok(value)
+            } else {
+                Err(DatabaseError::InvalidData)
             }
-            Err(DatabaseError::InvalidData)
         } else {
             Err(DatabaseError::KeyNotFound)
         }
