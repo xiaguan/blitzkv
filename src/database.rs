@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, error, info, warn};
 
@@ -10,22 +11,34 @@ use crate::storage::device::{SsdDevice, SsdError, SsdMetrics};
 use crate::storage::page::Page;
 
 const DEFAULT_PAGE_SIZE: u32 = 4096; // 4KB page size
-const DEFAULT_CACHE_SIZE: usize = 100; // 100 pages in cache
+const DEFAULT_CACHE_SIZE: usize = 50; // 100 pages in cache
 
-/// `ObjectMetadata` only keeps `freq_accessed` to determine data hotness.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+const DECAY_RATE: f64 = 0.2; // Decay rate parameter lambda
+
+/// `ObjectMetadata` keeps track of access patterns with decay.
+#[derive(Debug, Copy, Clone)]
 pub struct ObjectMetadata {
     pub location: Location,
     pub size: u32,
-    pub freq_accessed: u32, // access frequency
+    pub freq_accessed: f64, // access frequency with decay
+    pub last_access: u64,   // timestamp of last access
 }
 
 impl ObjectMetadata {
-    /// Update hotness based on access frequency
+    /// Update hotness based on access frequency with exponential decay
     /// Returns true if hot
     pub fn update_hotness(&mut self, hot_threshold: u32) -> bool {
-        self.freq_accessed += 1;
-        self.freq_accessed >= hot_threshold
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let time_diff = (now - self.last_access) as f64;
+        // Apply exponential decay: old_freq * e^(-λt) + 1
+        self.freq_accessed = self.freq_accessed * (-DECAY_RATE * time_diff).exp() + 1.0;
+        self.last_access = now;
+        info!("freq is {}", self.freq_accessed);
+        self.freq_accessed >= hot_threshold as f64
     }
 }
 
@@ -156,14 +169,6 @@ impl PageManager {
             return Ok(Rc::clone(page));
         }
         self.miss_count += 1;
-        // Then check in-memory pages
-        if let Some(status) = self.pages.get(&page_id) {
-            if let Some(page) = &status.in_memory {
-                let page_rc = Rc::clone(page);
-                self.page_cache.insert(page_id, Rc::clone(&page_rc));
-                return Ok(page_rc);
-            }
-        }
 
         // Finally read from disk
         let page = self.device.read_page(page_id)?;
@@ -264,20 +269,20 @@ impl PageManager {
         is_hot: bool,
     ) -> Result<Option<Location>, PageManagerError> {
         let location = self.set_inner(key, value, is_hot)?;
+        // After writing, we keep the page in memory since it's already up to date
+        // Only update free space tracking
         if let Some(loc) = &location {
-            let mut old_free = None;
-            let mut is_hot = None;
-            if let Some(status) = self.pages.get_mut(&loc.page_id) {
-                old_free = Some(status.free_space);
-                status.in_memory = None;
-                status.free_space = 0;
-                is_hot = Some(status.is_hot);
+            if let Some(status) = self.pages.get(&loc.page_id) {
+                let old_free = status.free_space;
+                let is_hot = status.is_hot;
+                if let Some(page_rc) = &status.in_memory {
+                    let new_free = page_rc.borrow().free_space() as usize;
+                    if let Some(status) = self.pages.get_mut(&loc.page_id) {
+                        status.free_space = new_free;
+                    }
+                    self.update_free_space_index(loc.page_id, old_free, new_free, is_hot);
+                }
             }
-            if let Some(old_free) = old_free {
-                self.update_free_space_index(loc.page_id, old_free, 0, is_hot.unwrap());
-            }
-            // Remove from cache when page is written
-            self.page_cache.remove(&loc.page_id);
         }
         Ok(location)
     }
@@ -335,10 +340,15 @@ impl Database {
                     String::from_utf8_lossy(key),
                     location
                 );
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
                 let metadata = ObjectMetadata {
                     location,
                     size: (key.len() + value.len()) as u32,
-                    freq_accessed: 1, // Updated access frequency
+                    freq_accessed: 1.0,
+                    last_access: now,
                 };
                 self.index.insert(key.to_vec(), metadata);
                 Ok(())
