@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use tracing::{debug, error, info, warn};
 
-use crate::storage::device::{SsdDevice, SsdError};
+use crate::storage::device::{SsdDevice, SsdError, SsdMetrics};
 use crate::storage::page::Page;
 
 const DEFAULT_PAGE_SIZE: u32 = 4096; // 4KB page size
@@ -20,16 +20,10 @@ pub struct ObjectMetadata {
 
 impl ObjectMetadata {
     /// Update hotness based on access frequency
-    /// Returns true if hotness status changed
-    pub fn update_hotness(&mut self) -> bool {
+    /// Returns true if hot
+    pub fn update_hotness(&mut self, hot_threshold: u32) -> bool {
         self.freq_accessed += 1;
-        let should_be_hot = self.freq_accessed >= 2;
-        if should_be_hot != self.location.is_hot {
-            self.location.is_hot = should_be_hot;
-            true
-        } else {
-            false
-        }
+        self.freq_accessed >= hot_threshold
     }
 }
 
@@ -244,18 +238,21 @@ pub struct Database {
     /// BTreeMap maintains mapping from key to metadata
     index: BTreeMap<Vec<u8>, ObjectMetadata>,
     page_manager: PageManager,
+    hot_threshold: u32,
 }
 
 impl Database {
     /// Create new database
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
+    pub fn new<P: AsRef<Path>>(path: P, hot_threshold: u32) -> Result<Self, DatabaseError> {
         info!(
-            "Initializing database with storage path {:?}",
-            path.as_ref()
+            "Initializing database with storage path {:?}, hot_threshold: {}",
+            path.as_ref(),
+            hot_threshold
         );
         Ok(Database {
             index: BTreeMap::new(),
             page_manager: PageManager::new(path, DEFAULT_PAGE_SIZE)?,
+            hot_threshold,
         })
     }
 
@@ -266,14 +263,7 @@ impl Database {
 
         // If key exists, update hotness
         if let Some(metadata) = self.index.get_mut(key) {
-            if metadata.update_hotness() {
-                debug!(
-                    "Key '{}' hotness changed to {}",
-                    String::from_utf8_lossy(key),
-                    metadata.location.is_hot
-                );
-            }
-            is_hot = metadata.location.is_hot;
+            is_hot = metadata.update_hotness(self.hot_threshold);
         }
 
         // Call PageManager to write
@@ -305,14 +295,7 @@ impl Database {
     /// Read value for key
     pub fn get(&mut self, key: &[u8]) -> Result<Vec<u8>, DatabaseError> {
         if let Some(metadata) = self.index.get_mut(key) {
-            // Update hotness and log if changed
-            if metadata.update_hotness() {
-                debug!(
-                    "Key '{}' hotness changed to {}",
-                    String::from_utf8_lossy(key),
-                    metadata.location.is_hot
-                );
-            }
+            metadata.update_hotness(self.hot_threshold);
 
             // Read data from corresponding Page
             if let Some(value) = self.page_manager.get(&metadata.location, key)? {
@@ -362,5 +345,10 @@ impl Database {
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
+    }
+
+    /// Get the SSD device metrics
+    pub fn metrics(&self) -> &SsdMetrics {
+        self.page_manager.device.metrics()
     }
 }

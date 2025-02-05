@@ -56,12 +56,6 @@ pub struct SsdDevice {
     metrics: SsdMetrics,
 }
 
-impl Drop for SsdDevice {
-    fn drop(&mut self) {
-        info!("Dropping SsdDevice with metrics:\n{}", self.metrics);
-    }
-}
-
 pub struct SsdMetrics {
     reads: u64,
     writes: u64,

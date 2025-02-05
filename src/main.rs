@@ -116,6 +116,9 @@ fn run_benchmark(db: &mut Database) -> Result<(), DatabaseError> {
     info!("Zipf parameter: s={}", ZIPF_S);
     info!("Total unique keys: {}", current_key_id);
 
+    // Print SSD metrics after benchmark
+    info!("SSD Metrics:\n{}", db.metrics());
+
     Ok(())
 }
 
@@ -130,7 +133,13 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut db = Database::new(data_dir.join("bench.db")).unwrap();
+    // Test with hot_threshold = 2
+    info!("Running benchmark with hot_threshold = 2");
+    let mut db = Database::new(data_dir.join("bench_hot2.db"), 2).unwrap();
+    run_benchmark(&mut db).unwrap();
 
+    // Test with hot_threshold = 200
+    info!("Running benchmark with hot_threshold = 200");
+    let mut db = Database::new(data_dir.join("bench_hot200.db"), 200).unwrap();
     run_benchmark(&mut db).unwrap();
 }
