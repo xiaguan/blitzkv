@@ -5,6 +5,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hdrhistogram::Histogram;
 use tracing::{debug, error, info, warn};
 
 use crate::storage::device::{SsdDevice, SsdError, SsdMetrics};
@@ -37,7 +38,6 @@ impl ObjectMetadata {
         // Apply exponential decay: old_freq * e^(-λt) + 1
         self.freq_accessed = self.freq_accessed * (-DECAY_RATE * time_diff).exp() + 1.0;
         self.last_access = now;
-        info!("freq is {}", self.freq_accessed);
         self.freq_accessed >= hot_threshold as f64
     }
 }
@@ -305,6 +305,8 @@ pub struct Database {
     index: BTreeMap<Vec<u8>, ObjectMetadata>,
     page_manager: PageManager,
     hot_threshold: u32,
+    /// Histogram for tracking access frequencies
+    freq_histogram: Histogram<u64>,
 }
 
 impl Database {
@@ -319,6 +321,7 @@ impl Database {
             index: BTreeMap::new(),
             page_manager: PageManager::new(path, DEFAULT_PAGE_SIZE)?,
             hot_threshold,
+            freq_histogram: Histogram::<u64>::new(3).unwrap(),
         })
     }
 
@@ -330,6 +333,10 @@ impl Database {
         // If key exists, update hotness
         if let Some(metadata) = self.index.get_mut(key) {
             is_hot = metadata.update_hotness(self.hot_threshold);
+            // Record frequency in histogram
+            self.freq_histogram
+                .record(metadata.freq_accessed as u64)
+                .unwrap();
         }
 
         // Call PageManager to write
@@ -396,6 +403,11 @@ impl Database {
     /// Get the SSD device metrics
     pub fn metrics(&self) -> &SsdMetrics {
         self.page_manager.device.metrics()
+    }
+
+    /// Get the frequency histogram
+    pub fn freq_histogram(&self) -> &Histogram<u64> {
+        &self.freq_histogram
     }
 
     pub fn hit_ratio(&self) -> f64 {

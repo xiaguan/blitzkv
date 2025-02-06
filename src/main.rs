@@ -25,6 +25,10 @@ struct BenchmarkResult {
     hit_ratio: f64,
     read_ssd_ops: u64,
     write_ssd_ops: u64,
+    freq_p50: f64, // 访问频率的50分位数
+    freq_p95: f64, // 访问频率的95分位数
+    freq_p99: f64, // 访问频率的99分位数
+    freq_max: f64, // 访问频率的最大值
 }
 
 // 保存测试操作的结构体
@@ -219,6 +223,13 @@ fn run_benchmark_with_params(
 
     let hit_ratio = db.hit_ratio();
     let ssd_metrics = db.metrics();
+    let freq_hist = db.freq_histogram();
+
+    info!("Access Frequency Statistics:");
+    info!("  p50: {:.2}", freq_hist.value_at_percentile(50.0) as f64);
+    info!("  p95: {:.2}", freq_hist.value_at_percentile(95.0) as f64);
+    info!("  p99: {:.2}", freq_hist.value_at_percentile(99.0) as f64);
+    info!("  max: {:.2}", freq_hist.max() as f64);
 
     Ok(BenchmarkResult {
         variant: variant.to_string(),
@@ -229,6 +240,10 @@ fn run_benchmark_with_params(
         hit_ratio,
         read_ssd_ops: ssd_metrics.reads(),
         write_ssd_ops: ssd_metrics.writes(),
+        freq_p50: freq_hist.value_at_percentile(50.0) as f64,
+        freq_p95: freq_hist.value_at_percentile(95.0) as f64,
+        freq_p99: freq_hist.value_at_percentile(99.0) as f64,
+        freq_max: freq_hist.max() as f64,
     })
 }
 
@@ -245,7 +260,7 @@ fn main() -> Result<(), DatabaseError> {
 
     let read_ratios = vec![0.7, 0.8];
     let zipf_params = vec![1.1, 1.2];
-    let variants = vec![("optimized", 2), ("baseline", 300)];
+    let variants = vec![("optimized", 3), ("baseline", 4)];
 
     let mut all_results = Vec::new();
 
