@@ -1,74 +1,87 @@
 import json
 import matplotlib.pyplot as plt
 import numpy as np
-from collections import defaultdict
 
-# 1. 读取 JSON 文件
+# Read JSON file
 with open("results.json", "r") as f:
     data = json.load(f)
 
-# 2. 数据整理：以 (read_ratio, zipf) 作为键，对数据进行分组
-#    每个键下分别有 baseline 和 optimized 两种变体的数据
-groups = defaultdict(dict)
-for entry in data:
-    key = (entry["read_ratio"], entry["zipf"])
-    groups[key][entry["variant"]] = entry
+# Create a figure with 2x2 subplots with adjusted size and spacing
+fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
+plt.subplots_adjust(wspace=0.3, hspace=0.4)
 
-# 为了使图表中 x 轴顺序更合理，这里对 keys 进行排序
-# 排序规则：先按 read_ratio 排序，再按 zipf 排序
-keys = sorted(groups.keys(), key=lambda x: (x[0], x[1]))
+# Extract data
+variants = ['baseline', 'optimized']
+metrics = {
+    'throughput': [],
+    'hit_ratio': [],
+    'read_ssd_ops': [],
+    'write_ssd_ops': []
+}
 
-# 生成 x 轴标签，例如 "read_ratio=0.7\nzipf=1.1"
-labels = [f"read_ratio={r}\nzipf={z}" for r, z in keys]
+for variant in variants:
+    variant_data = next(item for item in data if item['variant'] == variant)
+    metrics['throughput'].append(variant_data['throughput'])
+    metrics['hit_ratio'].append(variant_data['hit_ratio'])
+    metrics['read_ssd_ops'].append(variant_data['read_ssd_ops'])
+    metrics['write_ssd_ops'].append(variant_data['write_ssd_ops'])
 
-# 分别获取 baseline 和 optimized 的 throughput 数据
-baseline_throughput = []
-optimized_throughput = []
-for key in keys:
-    baseline_throughput.append(groups[key]["baseline"]["throughput"])
-    optimized_throughput.append(groups[key]["optimized"]["throughput"])
+def add_comparison_bars(ax, values, title, ylabel, format_str='.0f', scale_factor=1.05):
+    width = 0.25  # Reduced bar width
+    x = np.array([0])
+    
+    # Create thinner bars
+    bars = ax.bar(x - width/2, [values[0]], width, label=variants[0], color='skyblue', alpha=0.8)
+    bars2 = ax.bar(x + width/2, [values[1]], width, label=variants[1], color='salmon', alpha=0.8)
+    
+    # Calculate percentage change
+    pct_change = ((values[1] - values[0]) / values[0]) * 100
+    change_sign = '+' if pct_change >= 0 else ''
+    color = 'green' if pct_change >= 0 else 'red'
+    arrow = '▲' if pct_change >= 0 else '▼'
+    
+    # Add percentage change indicator with smaller font
+    ax.text(0, max(values) * scale_factor,
+           f'{arrow} {change_sign}{pct_change:.1f}%',
+           ha='center', va='bottom', color=color, fontweight='bold',
+           fontsize=9)
+    
+    # Add value labels on bars with smaller font
+    for bar in [bars[0], bars2[0]]:
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2, height,
+               f'{height:{format_str}}',
+               ha='center', va='bottom',
+               fontsize=8)
+    
+    ax.set_title(title, pad=10, fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=9)
+    ax.set_xticks([])
+    ax.legend(fontsize=8, loc='upper right')
+    
+    # Adjust y-axis limits for better spacing
+    ax.set_ylim(0, max(values) * 1.15)
 
-# 3. 绘制分组柱状图
-x = np.arange(len(keys))  # x 轴坐标
-width = 0.35  # 每个柱子的宽度
+# 1. Throughput Comparison
+add_comparison_bars(ax1, metrics['throughput'],
+                   'Throughput Comparison',
+                   'Throughput (ops/sec)')
 
-# 设置 seaborn 风格，使图表更美观
-fig, ax = plt.subplots(figsize=(10, 6))
+# 2. Hit Ratio Comparison
+add_comparison_bars(ax2, metrics['hit_ratio'],
+                   'Cache Hit Ratio Comparison',
+                   'Hit Ratio', '.3f')
 
-# 绘制两组柱状图
-rects1 = ax.bar(
-    x - width / 2, baseline_throughput, width, label="Baseline", color="skyblue"
-)
-rects2 = ax.bar(
-    x + width / 2, optimized_throughput, width, label="Optimized", color="salmon"
-)
+# 3. SSD Read Operations Comparison
+add_comparison_bars(ax3, metrics['read_ssd_ops'],
+                   'SSD Read Operations Comparison',
+                   'Number of SSD Read Operations')
 
-# 添加标题和标签
-ax.set_ylabel("Throughput")
-ax.set_title("Different Throughput with Different Read Ratio and Zipf")
-ax.set_xticks(x)
-ax.set_xticklabels(labels)
-ax.legend()
+# 4. SSD Write Operations Comparison
+add_comparison_bars(ax4, metrics['write_ssd_ops'],
+                   'SSD Write Operations Comparison',
+                   'Number of SSD Write Operations')
 
-
-# 在柱状图上添加数据标签，使图表更直观
-def autolabel(rects):
-    """为每个柱状图添加文本标签"""
-    for rect in rects:
-        height = rect.get_height()
-        ax.annotate(
-            f"{height:.0f}",
-            xy=(rect.get_x() + rect.get_width() / 2, height),
-            xytext=(0, 3),  # 偏移量
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-        )
-
-
-autolabel(rects1)
-autolabel(rects2)
-
+# Adjust layout
 plt.tight_layout()
-# 保存图像到文件，而不显示图形窗口
-plt.savefig("result.png", dpi=300)
+plt.savefig("result.png", dpi=300, bbox_inches='tight', pad_inches=0.2)
