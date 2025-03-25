@@ -225,5 +225,24 @@ fn main() -> Result<(), DatabaseError> {
     std::fs::write("results.json", json).unwrap();
     info!("All benchmark results written to results.json");
 
+    // Export detailed metrics for visualization
+    for &(variant_name, hot_threshold) in &variants {
+        let db_path = data_dir.join(format!("bench_{}.db", variant_name));
+        info!(
+            "Exporting detailed metrics for {} (db: {:?})",
+            variant_name, db_path
+        );
+        let mut db = Database::new(db_path, hot_threshold)?;
+
+        // Run a small benchmark to populate metrics
+        let _ = run_benchmark_with_params(&mut db, variant_name)?;
+
+        // Export metrics to JSON file
+        let metrics_json = serde_json::to_string_pretty(&db.export_metrics()).unwrap();
+        let output_path = format!("{}_vis.json", variant_name);
+        std::fs::write(&output_path, metrics_json).unwrap();
+        info!("Detailed metrics written to {}", output_path);
+    }
+
     Ok(())
 }

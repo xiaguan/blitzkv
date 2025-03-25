@@ -1,4 +1,5 @@
 use hashlink::LruCache;
+use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -48,12 +49,34 @@ pub struct Location {
     pub page_index: usize,
 }
 
+/// Page metrics for visualization
+#[derive(Debug, Serialize, Clone)]
+pub struct PageMetrics {
+    pub page_id: u64,
+    pub is_hot: bool,
+    pub free_space: usize,
+    pub access_count: u32,
+    pub last_access: u64,
+    pub objects: Vec<ObjectMetrics>,
+}
+
+/// Object metrics for visualization
+#[derive(Debug, Serialize, Clone)]
+pub struct ObjectMetrics {
+    pub key: String,
+    pub freq: f64,
+    pub size: u32,
+    pub last_access: u64,
+}
+
 /// Page status in memory or on SSD, with additional "pool" information.
 #[derive(Debug)]
 struct PageStatus {
     in_memory: Option<Rc<RefCell<Page>>>,
     is_hot: bool,
     free_space: usize,
+    access_count: u32,
+    last_access: u64,
 }
 
 /// PageManager related errors
@@ -116,6 +139,27 @@ impl PageManager {
         })
     }
 
+    /// Get page metrics for visualization
+    pub fn get_page_metrics(&self) -> HashMap<u64, PageMetrics> {
+        let mut metrics = HashMap::new();
+
+        for (page_id, status) in &self.pages {
+            metrics.insert(
+                *page_id,
+                PageMetrics {
+                    page_id: *page_id,
+                    is_hot: status.is_hot,
+                    free_space: status.free_space,
+                    access_count: status.access_count,
+                    last_access: status.last_access,
+                    objects: Vec::new(),
+                },
+            );
+        }
+
+        metrics
+    }
+
     fn find_suitable_page_id(&self, required_space: usize, is_hot: bool) -> Option<u64> {
         let map = if is_hot {
             &self.hot_free_spaces
@@ -166,6 +210,16 @@ impl PageManager {
         // First check the LRU cache
         if let Some(page) = self.page_cache.get(&page_id) {
             self.hit_count += 1;
+
+            // Update access count for the page
+            if let Some(status) = self.pages.get_mut(&page_id) {
+                status.access_count += 1;
+                status.last_access = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+            }
+
             return Ok(Rc::clone(page));
         }
         self.miss_count += 1;
@@ -175,13 +229,22 @@ impl PageManager {
         let free_space = page.free_space() as usize;
         let rc_page = Rc::new(RefCell::new(page));
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
         let entry = self.pages.entry(page_id).or_insert_with(|| PageStatus {
             in_memory: None,
             is_hot: false,
             free_space,
+            access_count: 0,
+            last_access: now,
         });
         entry.in_memory = Some(Rc::clone(&rc_page));
         entry.free_space = free_space;
+        entry.access_count += 1;
+        entry.last_access = now;
         let is_hot = entry.is_hot;
 
         self.update_free_space_index(page_id, 0, free_space, is_hot);
@@ -215,6 +278,7 @@ impl PageManager {
                     let new_free = page.free_space() as usize;
                     let status = self.pages.get_mut(&page_id).unwrap();
                     status.free_space = new_free;
+                    status.is_hot = is_hot; // Update hot status
 
                     self.update_free_space_index(page_id, old_free, new_free, is_hot);
 
@@ -234,12 +298,19 @@ impl PageManager {
             let free_space = new_page.free_space() as usize;
             let rc_page = Rc::new(RefCell::new(new_page));
 
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
             self.pages.insert(
                 page_id,
                 PageStatus {
                     in_memory: Some(Rc::clone(&rc_page)),
                     is_hot,
                     free_space,
+                    access_count: 1,
+                    last_access: now,
                 },
             );
 
@@ -307,6 +378,8 @@ pub struct Database {
     hot_threshold: u32,
     /// Histogram for tracking access frequencies
     freq_histogram: Histogram<u64>,
+    /// Page metrics for visualization
+    page_metrics: HashMap<u64, PageMetrics>,
 }
 
 impl Database {
@@ -322,6 +395,7 @@ impl Database {
             page_manager: PageManager::new(path, DEFAULT_PAGE_SIZE)?,
             hot_threshold,
             freq_histogram: Histogram::<u64>::new(3).unwrap(),
+            page_metrics: HashMap::new(),
         })
     }
 
@@ -358,6 +432,10 @@ impl Database {
                     last_access: now,
                 };
                 self.index.insert(key.to_vec(), metadata);
+
+                // Update page metrics for visualization
+                self.update_page_metrics(&key.to_vec(), &metadata);
+
                 Ok(())
             }
             None => {
@@ -373,15 +451,60 @@ impl Database {
     /// Read value for key
     pub fn get(&mut self, key: &[u8]) -> Result<Vec<u8>, DatabaseError> {
         if let Some(metadata) = self.index.get_mut(key) {
-            metadata.update_hotness(self.hot_threshold);
+            let is_hot = metadata.update_hotness(self.hot_threshold);
+            let location = metadata.location;
+            let metadata_copy = *metadata;
 
-            // Read data from corresponding Page
-            if let Some(value) = self.page_manager.get(&metadata.location, key)? {
-                return Ok(value);
-            }
-            Err(DatabaseError::InvalidData)
+            // First get the value to avoid multiple mutable borrows
+            let value = self
+                .page_manager
+                .get(&location, key)?
+                .ok_or(DatabaseError::InvalidData)?;
+
+            // Then update page metrics after getting the value
+            self.update_page_metrics(&key.to_vec(), &metadata_copy);
+
+            Ok(value)
         } else {
             Err(DatabaseError::KeyNotFound)
+        }
+    }
+
+    /// Update page metrics for visualization
+    fn update_page_metrics(&mut self, key: &[u8], metadata: &ObjectMetadata) {
+        // Get the latest page metrics from PageManager
+        let page_metrics = self.page_manager.get_page_metrics();
+
+        // Update our page_metrics with the latest data
+        for (page_id, metrics) in page_metrics {
+            self.page_metrics.insert(page_id, metrics);
+        }
+
+        // Update object metrics in the page
+        if let Some(page_metrics) = self.page_metrics.get_mut(&metadata.location.page_id) {
+            // Try to find existing object metrics
+            let key_str = String::from_utf8_lossy(key).to_string();
+            let mut found = false;
+
+            for obj_metrics in &mut page_metrics.objects {
+                if obj_metrics.key == key_str {
+                    // Update existing object metrics
+                    obj_metrics.freq = metadata.freq_accessed;
+                    obj_metrics.last_access = metadata.last_access;
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                // Add new object metrics
+                page_metrics.objects.push(ObjectMetrics {
+                    key: key_str,
+                    freq: metadata.freq_accessed,
+                    size: metadata.size,
+                    last_access: metadata.last_access,
+                });
+            }
         }
     }
 
@@ -417,5 +540,44 @@ impl Database {
         );
         (self.page_manager.hit_count as f64)
             / (self.page_manager.hit_count as f64 + self.page_manager.miss_count as f64)
+    }
+
+    /// Get page metrics for visualization
+    pub fn get_page_metrics(&self) -> &HashMap<u64, PageMetrics> {
+        &self.page_metrics
+    }
+
+    /// Export metrics to a JSON-serializable structure
+    pub fn export_metrics(&self) -> serde_json::Value {
+        let mut page_metrics_vec = Vec::new();
+        for (_, metrics) in &self.page_metrics {
+            page_metrics_vec.push(metrics.clone());
+        }
+
+        serde_json::json!({
+            "timestamp": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            "hot_threshold": self.hot_threshold,
+            "hit_ratio": self.hit_ratio(),
+            "total_pages": self.page_metrics.len(),
+            "total_objects": self.index.len(),
+            "ssd_metrics": {
+                "reads": self.metrics().reads(),
+                "writes": self.metrics().writes(),
+                "read_latency_p50": self.metrics().read_latency_percentile(50.0),
+                "read_latency_p95": self.metrics().read_latency_percentile(95.0),
+                "write_latency_p50": self.metrics().write_latency_percentile(50.0),
+                "write_latency_p95": self.metrics().write_latency_percentile(95.0),
+            },
+            "freq_histogram": {
+                "p50": self.freq_histogram().value_at_percentile(50.0),
+                "p95": self.freq_histogram().value_at_percentile(95.0),
+                "p99": self.freq_histogram().value_at_percentile(99.0),
+                "max": self.freq_histogram().max(),
+            },
+            "pages": page_metrics_vec,
+        })
     }
 }
