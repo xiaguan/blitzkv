@@ -1,26 +1,26 @@
 [
   {
     "variant": "optimized",
-    "throughput": 1597.207384201954,
-    "duration_secs": 173.573577697,
-    "hit_ratio": 0.5384735627024081,
-    "read_ssd_ops": 115149,
+    "throughput": 2999.3252444829163,
+    "duration_secs": 92.43178962,
+    "hit_ratio": 0.5410454795223828,
+    "read_ssd_ops": 114427,
     "write_ssd_ops": 41275,
-    "freq_p50": 1.0,
-    "freq_p95": 6.0,
-    "freq_p99": 12.0,
-    "freq_max": 170.0
+    "freq_p50": 2.0,
+    "freq_p95": 9.0,
+    "freq_p99": 18.0,
+    "freq_max": 410.0
   },
   {
     "variant": "baseline",
-    "throughput": 1581.5144936561087,
-    "duration_secs": 175.295895872,
-    "hit_ratio": 0.5262445583203482,
-    "read_ssd_ops": 117967,
+    "throughput": 1638.435351843113,
+    "duration_secs": 169.205943761,
+    "hit_ratio": 0.5255909615754699,
+    "read_ssd_ops": 118329,
     "write_ssd_ops": 41275,
     "freq_p50": 1.0,
     "freq_p95": 6.0,
     "freq_p99": 11.0,
-    "freq_max": 165.0
+    "freq_max": 185.0
   }
 ]

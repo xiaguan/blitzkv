@@ -208,7 +208,7 @@ fn main() -> Result<(), DatabaseError> {
     let data_dir = PathBuf::from("data");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let variants = vec![("optimized", 2), ("baseline", 40000)];
+    let variants = vec![("optimized", 3), ("baseline", 40000)];
     let mut all_results = Vec::new();
 
     // Run benchmark for each variant
