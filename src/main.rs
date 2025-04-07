@@ -98,7 +98,7 @@ impl TestData {
             };
 
             // Generate value with random size
-            let size: usize = record.io_size as usize % 400 + 620;
+            let size: usize = record.io_size as usize % 100 + 1024;
             let mut value = Vec::with_capacity(size);
             value.extend(std::iter::repeat(0u8).take(size));
 
@@ -112,6 +112,10 @@ impl TestData {
                 key: key.to_string().into_bytes(),
                 value,
             });
+
+            if operations.len() >= 150000 {
+                break;
+            }
         }
 
         Ok(TestData { operations })
@@ -208,7 +212,7 @@ fn main() -> Result<(), DatabaseError> {
     let data_dir = PathBuf::from("data");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let variants = vec![("optimized", 3), ("baseline", 40000)];
+    let variants = vec![("baseline", 40000), ("optimized", 3)];
     let mut all_results = Vec::new();
 
     // Run benchmark for each variant
@@ -220,29 +224,15 @@ fn main() -> Result<(), DatabaseError> {
         all_results.push(result);
     }
 
-    // Output as JSON file
-    let json = serde_json::to_string_pretty(&all_results).unwrap();
-    std::fs::write("results.json", json).unwrap();
-    info!("All benchmark results written to results.json");
+    //     // Run a small benchmark to populate metrics
+    //     let _ = run_benchmark_with_params(&mut db, variant_name)?;
 
-    // Export detailed metrics for visualization
-    for &(variant_name, hot_threshold) in &variants {
-        let db_path = data_dir.join(format!("bench_{}.db", variant_name));
-        info!(
-            "Exporting detailed metrics for {} (db: {:?})",
-            variant_name, db_path
-        );
-        let mut db = Database::new(db_path, hot_threshold)?;
-
-        // Run a small benchmark to populate metrics
-        let _ = run_benchmark_with_params(&mut db, variant_name)?;
-
-        // Export metrics to JSON file
-        let metrics_json = serde_json::to_string_pretty(&db.export_metrics()).unwrap();
-        let output_path = format!("{}_vis.json", variant_name);
-        std::fs::write(&output_path, metrics_json).unwrap();
-        info!("Detailed metrics written to {}", output_path);
-    }
+    //     // Export metrics to JSON file
+    //     let metrics_json = serde_json::to_string_pretty(&db.export_metrics()).unwrap();
+    //     let output_path = format!("{}_vis.json", variant_name);
+    //     std::fs::write(&output_path, metrics_json).unwrap();
+    //     info!("Detailed metrics written to {}", output_path);
+    // }
 
     Ok(())
 }

@@ -281,7 +281,7 @@ impl SsdDevice {
         // Update metrics
         self.metrics.writes += 1;
         self.metrics.write_bytes += bytes_written as u64;
-        self.sync().unwrap();
+        // self.sync().unwrap();
 
         // Manually deallocate the memory
         unsafe {
